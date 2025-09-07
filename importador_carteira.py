@@ -22,7 +22,7 @@ DATE_LETTERS  = ['CN','CQ','CR','CS','BQ','CE']  # 6 datas → L..Q
 
 CHUNK_ROWS    = 2000
 MAX_RETRIES   = 6
-FORCAR_DESTAQ = True  # destaque amarelo nas inserções
+FORCAR_DESTAQ = False  # destaque amarelo nas inserções
 
 # Mapeamento de Unidades (usado em CICLO.D→R e LV.A→R)
 MAP_UNIDADE = {
@@ -258,3 +258,4 @@ else:
 with_retry(w_dst.update, range_name="T2",
            values=[[f"Atualizado em: {now()}"]], value_input_option='USER_ENTERED')
 log(f"🎉 Fim — {rows0} linhas totais inseridas/atualizadas.")
+
