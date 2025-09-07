@@ -5,13 +5,12 @@ import time
 import sys
 import unicodedata
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from gspread.exceptions import APIError
 
 # === CONFIG ===
 ID_ORIGEM       = "1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM"
 ABA_HISTORICO   = "Historico"
-CAMINHO_CRED    = "credenciais.json"
+CAMINHO_CRED    = "credenciais.json"  # fallback local
 
 # === DESTINOS ===
 PID_IRECE        = "1zIfub-pAVtZGSjYT1Qa7HzjAof56VExU7U5WwLE382c"
@@ -53,10 +52,22 @@ RETRY_CRIT = (1, 3, 7, 15)    # backoff para operações críticas
 MAX_TENTATIVAS_DEST = 5
 DEST_BACKOFF_BASE_S = 5        # 5,10,20,40,80s
 
-# === AUTENTICAÇÃO ===
-escopos = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credenciais = ServiceAccountCredentials.from_json_keyfile_name(CAMINHO_CRED, escopos)
-gc = gspread.authorize(credenciais)
+# === AUTENTICAÇÃO (Secret ou arquivo local) ===
+import os, json, pathlib
+from google.oauth2.service_account import Credentials
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def make_creds():
+    env = os.environ.get("GOOGLE_CREDENTIALS")
+    if env:
+        return Credentials.from_service_account_info(json.loads(env), scopes=SCOPES)
+    return Credentials.from_service_account_file(pathlib.Path(CAMINHO_CRED), scopes=SCOPES)
+
+gc = gspread.authorize(make_creds())
 
 # === UTILS ===
 def _is_transient(e: Exception) -> bool:
