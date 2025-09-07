@@ -13,8 +13,7 @@ ORIGEM_ID     = '1lUNIeWCddfmvJEjWJpQMtuR4oRuMsI3VImDY0xBp3Bs'
 DESTINO_ID    = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA_ORIGEM    = 'Carteira'
 ABA_DESTINO   = 'Carteira'
-# Fallback local (se rodar na sua máquina). No Actions vem do Secret.
-CRED_JSON     = 'credenciais.json'
+CRED_JSON     = 'credenciais.json'   # fallback local
 
 # Colunas da ORIGEM na ordem desejada
 COLS_ORIGEM   = ['A','Z','B','C','D','E','U','T','N','AA','AB','CN','CQ','CR','CS','BQ','CE','V']
@@ -55,8 +54,8 @@ def with_retry(fn,*a,desc="",base=1,maxr=MAX_RETRIES,**k):
             time.sleep(s)
 
 # ---------- HELPERS ----------
-def col_letter(n): return re.sub(r'\d','',rowcol_to_a1(1,n))     # 1-based -> 'A','AA',...
-def a1index(L):    return a1_to_rowcol(f"{L}1")[1]                # 1-based
+def col_letter(n): return re.sub(r'\d','',rowcol_to_a1(1,n))
+def a1index(L):    return a1_to_rowcol(f"{L}1")[1]
 def ensure(ws,r,c):
     if ws.row_count<r or ws.col_count<c:
         log(f"🧩 resize → {r}x{c}")
@@ -100,7 +99,7 @@ def highlight(ws,start,count,end_col="Q"):
     except Exception as e:
         log(f"⚠️  Falhou ao colorir: {e}")
 
-# ---------- AUTH (portável: Secret ou arquivo local) ----------
+# ---------- AUTH (Secret ou arquivo local) ----------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -109,12 +108,8 @@ SCOPES = [
 def make_creds():
     env = os.environ.get("GOOGLE_CREDENTIALS")
     if env:
-        # Secret no Actions (JSON em string)
-        info = json.loads(env)
-        return Credentials.from_service_account_info(info, scopes=SCOPES)
-    # Fallback local
-    cred_path = pathlib.Path(CRED_JSON)
-    return Credentials.from_service_account_file(cred_path, scopes=SCOPES)
+        return Credentials.from_service_account_info(json.loads(env), scopes=SCOPES)
+    return Credentials.from_service_account_file(pathlib.Path(CRED_JSON), scopes=SCOPES)
 
 log("🔐 Autenticando…")
 gc = gspread.authorize(make_creds())
@@ -134,7 +129,7 @@ log(f"🧭 Lendo cabeçalho (linha 5) e dados… ({rng})")
 dat   = with_retry(w_src.get, rng, desc=f"get {rng}")
 hdr, rows = dat[0], dat[1:]
 
-idx      = [a1index(c)-1 for c in COLS_ORIGEM]  # 0-based
+idx      = [a1index(c)-1 for c in COLS_ORIGEM]
 tbl      = [[r[i] if i<len(r) else "" for i in idx] for r in rows if r and r[0].strip()]
 df       = pd.DataFrame(tbl, columns=[hdr[i] if i<len(hdr) else "" for i in idx])
 log(f"🧱 Origem: {len(df)} linhas × {len(df.columns)} colunas")
@@ -207,8 +202,8 @@ for i in range(N):
     linha[0]  = key                             # A ← E
     if larg >= 2:  linha[1]  = F[i] if i<len(F)  else ""  # B ← F
     if larg >= 8:  linha[7]  = C[i] if i<len(C)  else ""  # H ← C
-    if larg >= 11: linha[10] = L_[i] if i<len(L_) else "" # K ← L   (CORRETO)
-    if larg >= 18: linha[17] = uni_map                      # R ← D (mapeado)
+    if larg >= 11: linha[10] = L_[i] if i<len(L_) else "" # K ← L
+    if larg >= 18: linha[17] = uni_map                        # R ← D
     novas.append(linha)
 
 if novas:
