@@ -1,9 +1,9 @@
 name: Esteira - Orquestração
 
 on:
-  workflow_dispatch:        # botão "Run workflow"
+  workflow_dispatch:
   schedule:
-    # 10:00, 12:00, 15:00, 19:00 em America/Sao_Paulo -> 13:00, 15:00, 18:00, 22:00 UTC
+    # 10:00, 12:00, 15:00, 19:00 (BRT) -> 13,15,18,22 UTC
     - cron: "0 13,15,18,22 * * *"
 
 env:
@@ -38,8 +38,7 @@ jobs:
           test -n "${{ secrets.GOOGLE_CREDENTIALS }}" || (echo "Secret GOOGLE_CREDENTIALS ausente" && exit 1)
           printf "%s" '${{ secrets.GOOGLE_CREDENTIALS }}' > credenciais.json
 
-      # TROQUE o arquivo abaixo se o seu principal for outro
-      - name: Executar pipeline
+      - name: Executar pipeline (atualizar_replicar.py)
         run: |
           python atualizar_replicar.py | tee logs.txt
 
