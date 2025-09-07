@@ -28,7 +28,6 @@ ESCOPOS = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleap
 
 # === AUTENTICAÇÃO (portável) ===
 import os, json, pathlib
-
 def make_creds():
     env = os.environ.get('GOOGLE_CREDENTIALS')
     if env:
@@ -36,7 +35,7 @@ def make_creds():
     return Credentials.from_service_account_file(pathlib.Path('credenciais.json'), scopes=ESCOPOS)
 
 # === OPÇÕES ===
-APLICAR_FORMATACAO_NUMERICA = True     # aplicar NumberFormat em colunas numéricas
+APLICAR_FORMATACAO_NUMERICA = False    # desligado para evitar quota/503
 TENTATIVAS_MAX = 3                     # tentativas para cada script
 ATRASO_BASE = 5.0                      # atraso base entre tentativas
 
@@ -136,7 +135,7 @@ def limpar_e_escrever_destino(planilha_id, cabecalho, dados):
 
     # escreve cabeçalho (A1:S1)
     print("📝 Escrevendo cabeçalho…")
-    ws.update('A1:S1', [cabecalho], value_input_option='USER_ENTERED')
+    ws.update(range_name='A1:S1', values=[cabecalho], value_input_option='USER_ENTERED')
 
     # conversão de colunas possivelmente numéricas
     colunas_numericas = [12, 13, 14, 15, 16, 17]  # exemplo, ajuste se necessário
@@ -144,12 +143,12 @@ def limpar_e_escrever_destino(planilha_id, cabecalho, dados):
 
     # escreve dados em blocos
     print(f"🚚 Escrevendo {len(dados_fmt)} linhas em blocos…")
-    CHUNK = 1000
+    CHUNK = 4000
     ini = 0
     while ini < len(dados_fmt):
         parte = dados_fmt[ini:ini+CHUNK]
         rng = f"A{2+ini}:{a1(19, 1+ini+len(parte))}"
-        ws.update(rng, parte, value_input_option='USER_ENTERED')
+        ws.update(range_name=rng, values=parte, value_input_option='USER_ENTERED')
         ini += len(parte)
 
     # formatação numérica (opcional)
@@ -157,7 +156,7 @@ def limpar_e_escrever_destino(planilha_id, cabecalho, dados):
 
     # timestamp
     try:
-        ws.update('T2', [[f"Replicado em: {agora()}"]], value_input_option='USER_ENTERED')
+        ws.update(range_name='T2', values=[[f"Replicado em: {agora()}"]], value_input_option='USER_ENTERED')
     except Exception:
         pass
 
