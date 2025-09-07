@@ -1,25 +1,38 @@
-# importador_historico_rapido.py — BD_Carteira -> Historico na MESMA planilha
+# importador_historico.py — BD_Carteira -> Historico na MESMA planilha
 from datetime import datetime, timedelta
 import gspread
 import re, time
-from oauth2client.service_account import ServiceAccountCredentials
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # ========= CONFIG =========
 ID_PLANILHA  = "1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM"
 ABA_ORIGEM   = "BD_Carteira"
 ABA_DESTINO  = "Historico"
-CAM_CRED     = "credenciais.json"
+CAM_CRED     = "credenciais.json"   # fallback local
 
 FORMULA_AE = '=ARRAYFORMULA(SE(B3:B=""; ""; SE((AD3:AD="-") + ÉERROS(PROCH(AD3:AD; Esteira!$B$1:$K$1; 1; 0)); 0; 1)))'
 
 RETRY_CRIT = (1, 3, 7, 15)
 BASE_SERIAL = datetime(1899, 12, 30)
 
-# ========= AUTH =========
-scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds  = ServiceAccountCredentials.from_json_keyfile_name(CAM_CRED, scopes)
-gc     = gspread.authorize(creds)
+# ========= AUTH (Secret ou arquivo local) =========
+import os, json, pathlib
+from google.oauth2.service_account import Credentials
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def make_creds():
+    env = os.environ.get("GOOGLE_CREDENTIALS")
+    if env:
+        # Secret do GitHub Actions (string JSON)
+        return Credentials.from_service_account_info(json.loads(env), scopes=SCOPES)
+    # Fallback: arquivo local
+    return Credentials.from_service_account_file(pathlib.Path(CAM_CRED), scopes=SCOPES)
+
+gc = gspread.authorize(make_creds())
 
 # ========= UTILS =========
 def log(step, msg):
