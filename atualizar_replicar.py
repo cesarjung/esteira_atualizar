@@ -1,3 +1,10 @@
+# ---- usar credenciais do GitHub Actions (Secret GOOGLE_CREDENTIALS) ----
+import os, pathlib
+CREDS_ENV = os.environ.get("GOOGLE_CREDENTIALS")
+CREDS_PATH = pathlib.Path("credenciais.json")
+if CREDS_ENV and not CREDS_PATH.exists():
+    CREDS_PATH.write_text(CREDS_ENV, encoding="utf-8")
+# -----------------------------------------------------------------------
 # run_atualizar_com_replicas.py
 # Orquestrador único: Atualiza bancos (BLOCO 1 e BLOCO 2) e, se OK, executa as réplicas (replicar_*).
 import subprocess
@@ -347,3 +354,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
