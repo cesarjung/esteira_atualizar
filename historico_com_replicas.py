@@ -19,7 +19,7 @@ MAX_ATTEMPTS = 3
 BACKOFF_BASE_SECONDS = 5
 
 # Scripts em ORDEM
-SCRIPT_IMPORTADOR = "importador_historico_rapido.py"
+SCRIPT_IMPORTADOR = "importador_historico.py"
 SCRIPT_REPLICADOR = "replicador_historico.py"
 
 # ===== UTILS =====
@@ -109,3 +109,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
