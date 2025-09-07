@@ -1,6 +1,7 @@
 import time, random, re, unicodedata
 from datetime import datetime
 
+import os, json, pathlib
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
@@ -12,7 +13,8 @@ ORIGEM_ID     = '1lUNIeWCddfmvJEjWJpQMtuR4oRuMsI3VImDY0xBp3Bs'
 DESTINO_ID    = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA_ORIGEM    = 'Carteira'
 ABA_DESTINO   = 'Carteira'
-CRED_JSON     = r'C:\Users\Sirtec\Desktop\Importador Carteira\credenciais.json'
+# Fallback local (se rodar na sua máquina). No Actions vem do Secret.
+CRED_JSON     = 'credenciais.json'
 
 # Colunas da ORIGEM na ordem desejada
 COLS_ORIGEM   = ['A','Z','B','C','D','E','U','T','N','AA','AB','CN','CQ','CR','CS','BQ','CE','V']
@@ -98,12 +100,24 @@ def highlight(ws,start,count,end_col="Q"):
     except Exception as e:
         log(f"⚠️  Falhou ao colorir: {e}")
 
-# ---------- AUTH ----------
+# ---------- AUTH (portável: Secret ou arquivo local) ----------
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def make_creds():
+    env = os.environ.get("GOOGLE_CREDENTIALS")
+    if env:
+        # Secret no Actions (JSON em string)
+        info = json.loads(env)
+        return Credentials.from_service_account_info(info, scopes=SCOPES)
+    # Fallback local
+    cred_path = pathlib.Path(CRED_JSON)
+    return Credentials.from_service_account_file(cred_path, scopes=SCOPES)
+
 log("🔐 Autenticando…")
-gc = gspread.authorize(Credentials.from_service_account_file(
-    CRED_JSON,
-    scopes=['https://www.googleapis.com/auth/spreadsheets','https://www.googleapis.com/auth/drive']
-))
+gc = gspread.authorize(make_creds())
 
 log("📂 Abrindo planilhas…")
 b_src = with_retry(gc.open_by_key, ORIGEM_ID,  desc="open origem")
