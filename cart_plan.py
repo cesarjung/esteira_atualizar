@@ -118,6 +118,7 @@ safe_update(ws_dst, "K1",   header_K)
 
 # ========= COLETA DE DADOS =========
 todos_FI = []  # linhas com 4 colunas → F..I
+todas_J  = []  # <<< NOVO: 1 coluna → J (AL da origem)
 todas_K  = []  # 1 coluna → K
 total_linhas = 0
 t0 = time.time()
@@ -132,18 +133,20 @@ for idx, origem_id in enumerate(ORIGENS, 1):
         valores = with_retry(ws_src.get, "A6:BI", desc=f"get A6:BI origem {idx}")
         log(f"   ↳ Linhas lidas: {len(valores)}")
 
-        # Extrai M(13)->idx12, O(15)->14, P(16)->15, Q(17)->16, BI(61)->60
+        # Extrai M(13)->idx12, O(15)->14, P(16)->15, Q(17)->16, AL(38)->37, BI(61)->60
         for row in valores:
-            m  = row[12] if len(row) > 12 else ""  # UNIDADE
-            o  = row[14] if len(row) > 14 else ""  # FIM PREVISTO (data)
-            p  = row[15] if len(row) > 15 else ""  # STATUS EXECUCAO
-            q  = row[16] if len(row) > 16 else ""  # PROJETO
-            bi = row[60] if len(row) > 60 else ""  # DATA BI (data)
+            m  = row[12] if len(row) > 12 else ""   # UNIDADE
+            o  = row[14] if len(row) > 14 else ""   # FIM PREVISTO (data)
+            p  = row[15] if len(row) > 15 else ""   # STATUS EXECUCAO
+            q  = row[16] if len(row) > 16 else ""   # PROJETO
+            al = row[37] if len(row) > 37 else ""   # <<< NOVO: AL (38ª coluna)
+            bi = row[60] if len(row) > 60 else ""   # DATA BI (data)
 
             o_fmt  = parse_data_br(o)
             bi_fmt = parse_data_br(bi)
 
             todos_FI.append([m, o_fmt, p, q])
+            todas_J.append([al])        # <<< NOVO: empilha AL → J
             todas_K.append([bi_fmt])
 
         total_linhas += len(valores)
@@ -155,11 +158,12 @@ for idx, origem_id in enumerate(ORIGENS, 1):
 log(f"🧮 Total consolidado: {len(todos_FI)} linhas úteis")
 
 # ========= LIMPEZA DESTINO =========
-safe_clear(ws_dst, ["F2:I", "K2:K"])
+safe_clear(ws_dst, ["F2:I", "J2:J", "K2:K"])  # <<< NOVO: limpa J também
 
 # ========= UPLOAD (EM BLOCOS) =========
 if todos_FI:
     chunked_update(ws_dst, start_row=2, start_col_letter="F", end_col_letter="I", values=todos_FI)
+    chunked_update(ws_dst, start_row=2, start_col_letter="J", end_col_letter="J", values=todas_J)  # <<< NOVO
     chunked_update(ws_dst, start_row=2, start_col_letter="K", end_col_letter="K", values=todas_K)
 else:
     log("⛔ Nada para escrever.")
@@ -200,4 +204,4 @@ else:
 agora = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 safe_update(ws_dst, "E1", [[f"Atualizado em: {agora}"]])
 
-log(f"🏁 FINALIZADO. Linhas processadas: {total_linhas} | tempo total {time.time():.1f}s")
+log(f"🏁 FINALIZADO. Linhas processadas: {total_linhas} | tempo total {time.time():1.1f}s")
