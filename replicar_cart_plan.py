@@ -1,4 +1,4 @@
-# replicar_bd_exec_fghi.py — rápido, resiliente e com limpeza correta de F:I
+# replicar_bd_exec_fghij.py — rápido, resiliente e com limpeza correta de F:J
 from datetime import datetime
 import re
 import time
@@ -20,15 +20,15 @@ DESTINOS = [
 ]
 
 # Faixa de origem/destino
-SRC_RANGE = 'F2:I'   # F,G,H,I
+SRC_RANGE = 'F2:J'   # F,G,H,I,J  (antes: F2:I)
 DST_START_COL = 'F'
-DST_END_COL   = 'I'
+DST_END_COL   = 'J'  # (antes: I)
 DST_START_ROW = 2
 CARIMBAR_CEL  = 'E1'
 
 # Opções
-APAGAR_ANTES_FI       = True   # apagão em F2:I antes de escrever
-APLICAR_FORMATO_DATA_G = False # se True, força G como DATE dd/mm/yyyy
+APAGAR_ANTES_FI        = True   # apagão em F2:J antes de escrever
+APLICAR_FORMATO_DATA_G = False  # se True, força G como DATE dd/mm/yyyy
 CARIMBAR               = True
 
 # Retries e backoff
@@ -110,40 +110,36 @@ def normaliza_data_ddmmyyyy(txt):
             continue
     return s  # USER_ENTERED tenta interpretar
 
-def tratar_row_fghi(r4):
-    """Mantém F,H,I como estão (removendo apóstrofo inicial); G vira data dd/mm/aaaa se possível, senão número."""
-    # garante 4 colunas
-    r = (r4 + [""] * 4)[:4]
-    # tira apóstrofo inicial de F,H,I
-    for idx in (0, 2, 3):
+def tratar_row_fghij(r5):
+    """F,H,I,J removem apóstrofo inicial; G vira data dd/mm/aaaa se possível, senão número."""
+    r = (r5 + [""] * 5)[:5]
+    # tira apóstrofo de F,H,I,J
+    for idx in (0, 2, 3, 4):
         if isinstance(r[idx], str) and r[idx].startswith("'"):
             r[idx] = r[idx][1:]
-
+    # G preferencialmente data
     g_raw = r[1]
     g_fmt = normaliza_data_ddmmyyyy(g_raw)
-    if g_fmt and re.match(r'^\d{2}/\d{2}/\d{4}$', g_fmt):
-        r[1] = g_fmt
-    else:
-        r[1] = limpar_num(g_raw)
+    r[1] = g_fmt if g_fmt and re.match(r'^\d{2}/\d{2}/\d{4}$', g_fmt) else limpar_num(g_raw)
     return r
 
 # ========= LER FONTE =========
 print(f"📥 Lendo {ID_ORIGEM}/{ABA} ({SRC_RANGE})…")
 ws_src = gc.open_by_key(ID_ORIGEM).worksheet(ABA)
-vals = _retry(RETRY_CRIT, ws_src.get, SRC_RANGE, op_name='get F2:I') or []
+vals = _retry(RETRY_CRIT, ws_src.get, SRC_RANGE, op_name='get F2:J') or []
 
 linhas = []
 for r in vals:
-    r4 = (r + [""] * 4)[:4]
-    if not any((c or "").strip() for c in r4):
+    r5 = (r + [""] * 5)[:5]
+    if not any((c or "").strip() for c in r5):
         continue
-    linhas.append(tratar_row_fghi(r4))
+    linhas.append(tratar_row_fghij(r5))
 
 nlin = len(linhas)
 print(f"✅ {nlin} linhas preparadas.\n")
 
 if nlin == 0:
-    print("⚠️ Nada a replicar (F2:I está vazio).")
+    print("⚠️ Nada a replicar (F2:J está vazio).")
     sys.exit(0)
 
 # ========= ESCRITA =========
@@ -164,17 +160,17 @@ def escrever_tudo(ws):
 
     ensure_grid(ws, min_rows=max(last_row, 2), min_cols_letter=DST_END_COL)
 
-    # apagão antes (F2:I)
+    # apagão antes (F2:J)
     if APAGAR_ANTES_FI:
-        _retry(RETRY_CRIT, ws.spreadsheet.values_clear, f"'{ws.title}'!{DST_START_COL}{DST_START_ROW}:{DST_END_COL}", op_name='values_clear F2:I')
+        _retry(RETRY_CRIT, ws.spreadsheet.values_clear, f"'{ws.title}'!{DST_START_COL}{DST_START_ROW}:{DST_END_COL}", op_name='values_clear F2:J')
 
     # escrita única
     _retry(RETRY_CRIT, ws.update, values=linhas, range_name=rng,
-           value_input_option="USER_ENTERED", op_name='update F2:I')
+           value_input_option="USER_ENTERED", op_name='update F2:J')
 
     # limpa rabo (linhas abaixo)
     tail_rng = f"'{ws.title}'!{DST_START_COL}{last_row+1}:{DST_END_COL}"
-    _retry(RETRY_CRIT, ws.spreadsheet.values_clear, tail_rng, op_name='values_clear rabo F:I')
+    _retry(RETRY_CRIT, ws.spreadsheet.values_clear, tail_rng, op_name='values_clear rabo F:J')
 
 def formatar(ws):
     if not APLICAR_FORMATO_DATA_G or nlin == 0:
@@ -241,7 +237,7 @@ def tentar_destino_ate_dar_certo(planilha_id: str):
                 sys.exit(1)
 
 # ========= EXECUÇÃO =========
-print(f"📦 Pronto para replicar: {nlin} linhas (F:I).")
+print(f"📦 Pronto para replicar: {nlin} linhas (F:J).")
 for pid in DESTINOS:
     tentar_destino_ate_dar_certo(pid)
-print("🏁 Replicação de BD_EXEC (F:I) finalizada.")
+print("🏁 Replicação de BD_EXEC (F:J) finalizada.")
