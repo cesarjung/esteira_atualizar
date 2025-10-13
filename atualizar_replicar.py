@@ -88,6 +88,21 @@ def _sleep_backoff(attempt: int, base: float = BASE_SLEEP):
     s = min(60.0, base * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
     time.sleep(s)
 
+def _retry_5xx(fn, *args, max_tries=MAX_API_RETRIES, base=BASE_SLEEP, **kwargs):
+    """Retry helper para 429/5xx com backoff e jitter."""
+    last = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            last = e
+            code = _status_code_from_apierror(e)
+            if code in RETRYABLE_CODES:
+                _sleep_backoff(attempt, base)
+                continue
+            raise
+    raise last
+
 def retry_update(ws, range_name: str, values, value_input_option: str = "USER_ENTERED", desc="update"):
     attempt = 0
     while True:
@@ -102,23 +117,51 @@ def retry_update(ws, range_name: str, values, value_input_option: str = "USER_EN
             _sleep_backoff(attempt)
 
 def batch_get_safe(ws, ranges, max_per_call=BATCH_GET_MAX_PER_CALL, max_retries=MAX_API_RETRIES, base_sleep=BASE_SLEEP, desc="batch_get"):
+    """
+    Mantém a MESMA lógica: ler uma lista de ranges e devolver como ws.batch_get.
+    Estratégia robusta contra 503/500/429:
+      1) Tenta em chunks (p.ex. 8..40 ranges por chamada).
+      2) Se 5xx/429, rebaixa para chunk=1 (um range por chamada).
+      3) Se ainda falhar, fallback para ws.get(a1) serial (1 a 1), preservando a ordem.
+    """
     if not ranges:
         return []
+
     results = []
-    for i in range(0, len(ranges), max_per_call):
-        chunk = ranges[i:i + max_per_call]
-        attempt = 0
-        while True:
-            try:
-                results.extend(ws.batch_get(chunk))
-                break
-            except APIError as e:
-                attempt += 1
-                code = _status_code_from_apierror(e)
-                if attempt >= max_retries or code not in RETRYABLE_CODES:
-                    raise
-                print(f"[batch_get_safe] ⚠️ {desc}: {e} — retry {attempt}/{max_retries-1} (chunk={len(chunk)})", flush=True)
-                _sleep_backoff(attempt, base_sleep)
+    n = len(ranges)
+    i = 0
+    # Começa conservador (≤ max_per_call, mas não exagera para evitar URLs enormes)
+    cur_chunk = min(max_per_call, 8)
+
+    while i < n:
+        grp = ranges[i:i + cur_chunk]
+        try:
+            res = _retry_5xx(ws.batch_get, grp, max_tries=max_retries, base=base_sleep)
+            results.extend(res)
+            i += cur_chunk
+        except APIError as e:
+            code = _status_code_from_apierror(e)
+            msg = str(e)
+            if code in RETRYABLE_CODES:
+                if cur_chunk > 1:
+                    # Rebaixa para serial (chunk=1) e tenta novamente sem avançar i
+                    print(f"[batch_get_safe] ⚠️ {desc}: {e} — rebaixando para chunk=1 (era {cur_chunk})", flush=True)
+                    cur_chunk = 1
+                    continue
+                # Já está em chunk=1 e mesmo assim falhou — fallback para ws.get
+                a1 = grp[0]
+                try:
+                    val = _retry_5xx(ws.get, a1, max_tries=max_retries, base=base_sleep)
+                    # Normaliza para formato batch_get: lista de listas (linhas)
+                    results.append(val if isinstance(val, list) else [])
+                    i += 1
+                except APIError as e2:
+                    print(f"[batch_get_safe] ⚠️ fallback ws.get falhou em {a1}: {e2}", flush=True)
+                    results.append([])
+                    i += 1
+            else:
+                # Erro não retryable: propaga
+                raise
     return results
 
 def get_ws():
@@ -215,7 +258,8 @@ def ensure_block(ws, base_dir: Path, steps, idx_offset: int = 0) -> int:
             executed += 1
             run_step(ws, base_dir, script, row, idx_offset + 1, idx_offset + total_planned, attempts[row])
 
-        status = get_status_map(ws, [row for _, r in steps])
+        # FIX: aqui havia um bug (row vs r) — lendo de novo o status com a lista correta de linhas
+        status = get_status_map(ws, [r for _, r in steps])
         if all(is_ok_value(status.get(r, "")) for _, r in steps):
             break
 
@@ -354,4 +398,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
