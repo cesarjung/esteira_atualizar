@@ -49,7 +49,6 @@ def _status_code_from_apierror(e: APIError):
     return int(m.group(1)) if m else None
 
 def _sleep_backoff(attempt, base=1.0):
-    # backoff exponencial + jitter, com teto
     time.sleep(min(60.0, base * (2 ** (attempt - 1)) + random.uniform(0, 0.8)))
 
 def with_retry(fn, *a, desc="", base=1, maxr=MAX_RETRIES, **k):
@@ -63,7 +62,6 @@ def with_retry(fn, *a, desc="", base=1, maxr=MAX_RETRIES, **k):
             if r >= maxr or (code is not None and code not in RETRYABLE_CODES):
                 log(f"❌ {desc or fn.__name__}: {e}")
                 raise
-            # 429: espere um pouco mais
             if code == 429:
                 wait = min(60.0, 5.0 * r + random.uniform(0, 2.0))
                 log(f"⚠️  {e} — retry {r}/{maxr-1} em {wait:.1f}s ({desc or fn.__name__})")
@@ -105,7 +103,7 @@ def parse_dates(sr):
         s = s.where(~m, pd.to_datetime(n, unit='D', origin='1899-12-30', errors='coerce'))
     return s.dt.strftime('%d/%m/%Y').where(s.notna(), "")
 
-# ---------- Leituras RESILIENTES e DELIMITADAS ----------
+# ---------- Leituras RESILIENTES ----------
 def get_with_retry(ws, a1_range: str, max_tries=MAX_RETRIES, base_sleep=1.1):
     for attempt in range(1, max_tries + 1):
         try:
@@ -123,11 +121,25 @@ def get_with_retry(ws, a1_range: str, max_tries=MAX_RETRIES, base_sleep=1.1):
                 _sleep_backoff(attempt, base_sleep)
     return []
 
+def batch_get_with_retry(ws, ranges, max_tries=MAX_RETRIES, base_sleep=1.1, desc="batch_get"):
+    for attempt in range(1, max_tries + 1):
+        try:
+            return ws.batch_get(ranges)
+        except APIError as e:
+            code = _status_code_from_apierror(e)
+            if code not in RETRYABLE_CODES or attempt >= max_tries:
+                log(f"❌ {desc}: {e}")
+                raise
+            if code == 429:
+                wait = min(60.0, 5.0 * attempt + random.uniform(0, 2.0))
+                log(f"[{desc}] 429 — aguardando {wait:.1f}s…")
+                time.sleep(wait)
+            else:
+                log(f"[{desc}] {code} — retry {attempt}/{max_tries-1}")
+                _sleep_backoff(attempt, base_sleep)
+
+# ---- leitura delimitada de UMA coluna (fallback) ----
 def load_col_bounded(ws, L, chunk_rows=10000):
-    """
-    Lê uma coluna L a partir da linha 2 até row_count, com fallback em chunks
-    se a leitura inteira falhar.
-    """
     end_row = max(ws.row_count or 0, 2)
     if end_row < 2:
         return []
@@ -137,7 +149,6 @@ def load_col_bounded(ws, L, chunk_rows=10000):
         return [(r[0].strip() if r and r[0] else "") for r in raw]
     except APIError as e:
         log(f"[load_col_bounded] downgrade para chunks ({L}) por erro: {e}")
-        # fallback: ler em pedaços
         out = []
         start = 2
         while start <= end_row:
@@ -147,12 +158,39 @@ def load_col_bounded(ws, L, chunk_rows=10000):
             start = stop + 1
         return out
 
-def load_col(ws, L):
+# ---- leitura delimitada de VÁRIAS colunas, com batch e fallback em chunks ----
+def load_cols_bounded(ws, letters, chunk_rows=5000):
     """
-    Mantém a assinatura usada no seu código,
-    agora usando a versão delimitada e resiliente.
+    Retorna dict { 'E': [...], 'F': [...], ... } lendo de 2..row_count.
+    Tenta uma única chamada batch_get para TODAS as colunas.
+    Se der erro, faz fallback por CHUNKS mas ainda batendo em batch (todas as letras de uma vez).
     """
-    return load_col_bounded(ws, L)
+    letters = list(letters)
+    end_row = max(ws.row_count or 0, 2)
+    out = {L: [] for L in letters}
+    if end_row < 2:
+        return out
+
+    # tentativa 1: uma chamada batch para tudo
+    try:
+        ranges = [f"{L}2:{L}{end_row}" for L in letters]
+        res = batch_get_with_retry(ws, ranges, desc=f"batch_get {ws.title} {','.join(letters)}")
+        for L, r in zip(letters, res):
+            out[L] = [(row[0].strip() if row and row[0] else "") for row in r]
+        return out
+    except APIError as e:
+        log(f"[load_cols_bounded] fallback em chunks por erro: {e}")
+
+    # fallback por chunks (mas ainda em batch por chunk)
+    start = 2
+    while start <= end_row:
+        stop = min(end_row, start + chunk_rows - 1)
+        ranges = [f"{L}{start}:{L}{stop}" for L in letters]
+        res = batch_get_with_retry(ws, ranges, desc=f"batch_get {ws.title} {start}-{stop}")
+        for L, r in zip(letters, res):
+            out[L].extend([(row[0].strip() if row and row[0] else "") for row in r])
+        start = stop + 1
+    return out
 
 def highlight(ws, start, count, end_col="Q"):
     if not FORCAR_DESTAQ or count <= 0: return
@@ -165,7 +203,7 @@ def highlight(ws, start, count, end_col="Q"):
     except Exception as e:
         log(f"⚠️  Falhou ao colorir: {e}")
 
-# ---------- AUTH (Secret ou arquivo local) ----------
+# ---------- AUTH ----------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -245,12 +283,13 @@ log("✅ Escrita de Carteira concluída.")
 log("🔗 CICLO (E→A, F→B, C→H, L→K, D→R)")
 w_ciclo = with_retry(b_dst.worksheet, "CICLO", desc="ws CICLO")
 
-# Leituras resilientes e DELIMITADAS
-E  = load_col(w_ciclo, "E")   # → A (ID/chave)
-F  = load_col(w_ciclo, "F")   # → B
-C  = load_col(w_ciclo, "C")   # → H
-L_ = load_col(w_ciclo, "L")   # → K
-D  = load_col(w_ciclo, "D")   # → R (unidade mapeada)
+# Lê TODAS as colunas de uma vez (com fallback em chunks)
+ciclo_cols = load_cols_bounded(w_ciclo, ["E","F","C","L","D"])
+E  = ciclo_cols["E"]   # → A (ID/chave)
+F  = ciclo_cols["F"]   # → B
+C  = ciclo_cols["C"]   # → H
+L_ = ciclo_cols["L"]   # → K
+D  = ciclo_cols["D"]   # → R (unidade mapeada)
 
 # IDs já existentes (delimitado até o fim atual da planilha de destino)
 exist_A = load_col_bounded(w_dst, "A")
@@ -288,12 +327,14 @@ else:
 log("🔗 LV CICLO (B→A, C→B, 'SOMENTE LV'→H, Unidade→R)")
 w_lv = with_retry(b_dst.worksheet, "LV CICLO", desc="ws LV")
 
-A_uni = load_col(w_lv, "A")   # Unidade (bruta)
-B_id  = load_col(w_lv, "B")   # → A
-C_prj = load_col(w_lv, "C")   # → B
+# Também em batch (A,B,C)
+lv_cols = load_cols_bounded(w_lv, ["A","B","C"])
+A_uni = lv_cols["A"]   # Unidade (bruta)
+B_id  = lv_cols["B"]   # → A
+C_prj = lv_cols["C"]   # → B
 
 # Reaproveita o conjunto existente lido antes
-exist = set(exist)  # já contém A2:A do destino
+exist = set(exist)
 
 novas_lv=[]; cont={}
 N = max(len(A_uni), len(B_id), len(C_prj))
