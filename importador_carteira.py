@@ -42,24 +42,45 @@ MAP_UNIDADE = {
 def now(): return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 def log(msg): print(f"[{now()}] {msg}", flush=True)
 
-def with_retry(fn,*a,desc="",base=1,maxr=MAX_RETRIES,**k):
-    r=0
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
+
+def _status_code_from_apierror(e: APIError):
+    m = re.search(r"\[(\d+)\]", str(e))
+    return int(m.group(1)) if m else None
+
+def _sleep_backoff(attempt, base=1.0):
+    # backoff exponencial + jitter, com teto
+    time.sleep(min(60.0, base * (2 ** (attempt - 1)) + random.uniform(0, 0.8)))
+
+def with_retry(fn, *a, desc="", base=1, maxr=MAX_RETRIES, **k):
+    r = 0
     while True:
-        try: return fn(*a,**k)
+        try:
+            return fn(*a, **k)
         except APIError as e:
-            r+=1
-            if r>=maxr: log(f"❌ {desc or fn.__name__}: {e}"); raise
-            s=min(60,base*2**(r-1)+random.uniform(0,.75))
-            log(f"⚠️  {e} — retry {r}/{maxr-1} em {s:.1f}s ({desc or fn.__name__})")
-            time.sleep(s)
+            r += 1
+            code = _status_code_from_apierror(e)
+            if r >= maxr or (code is not None and code not in RETRYABLE_CODES):
+                log(f"❌ {desc or fn.__name__}: {e}")
+                raise
+            # 429: espere um pouco mais
+            if code == 429:
+                wait = min(60.0, 5.0 * r + random.uniform(0, 2.0))
+                log(f"⚠️  {e} — retry {r}/{maxr-1} em {wait:.1f}s ({desc or fn.__name__})")
+                time.sleep(wait)
+            else:
+                s = min(60, base * 2 ** (r - 1) + random.uniform(0, .75))
+                log(f"⚠️  {e} — retry {r}/{maxr-1} em {s:.1f}s ({desc or fn.__name__})")
+                time.sleep(s)
 
 # ---------- HELPERS ----------
 def col_letter(n): return re.sub(r'\d','',rowcol_to_a1(1,n))
 def a1index(L):    return a1_to_rowcol(f"{L}1")[1]
-def ensure(ws,r,c):
-    if ws.row_count<r or ws.col_count<c:
+
+def ensure(ws, r, c):
+    if ws.row_count < r or ws.col_count < c:
         log(f"🧩 resize → {r}x{c}")
-        with_retry(ws.resize,r,c,desc="resize")
+        with_retry(ws.resize, r, c, desc="resize")
 
 def norm_acento_up(s: str) -> str:
     if s is None: return ''
@@ -77,24 +98,69 @@ def normalize(v):
 def df2values(df): return [[normalize(c) for c in row] for row in df.values.tolist()]
 
 def parse_dates(sr):
-    s=pd.to_datetime(sr,dayfirst=True,errors='coerce')
-    m=s.isna()
+    s = pd.to_datetime(sr, dayfirst=True, errors='coerce')
+    m = s.isna()
     if m.any():
-        n=pd.to_numeric(sr,errors='coerce')
-        s=s.where(~m,pd.to_datetime(n,unit='D',origin='1899-12-30',errors='coerce'))
-    return s.dt.strftime('%d/%m/%Y').where(s.notna(),"")
+        n = pd.to_numeric(sr, errors='coerce')
+        s = s.where(~m, pd.to_datetime(n, unit='D', origin='1899-12-30', errors='coerce'))
+    return s.dt.strftime('%d/%m/%Y').where(s.notna(), "")
 
-def load_col(ws,L):
-    raw=with_retry(ws.get,f"{L}2:{L}",desc=f"get {ws.title}!{L}2:{L}")
-    return [(r[0].strip() if r and r[0] else "") for r in raw]
+# ---------- Leituras RESILIENTES e DELIMITADAS ----------
+def get_with_retry(ws, a1_range: str, max_tries=MAX_RETRIES, base_sleep=1.1):
+    for attempt in range(1, max_tries + 1):
+        try:
+            return ws.get(a1_range)
+        except APIError as e:
+            code = _status_code_from_apierror(e)
+            if code not in RETRYABLE_CODES or attempt >= max_tries:
+                raise
+            if code == 429:
+                wait = min(60.0, 5.0 * attempt + random.uniform(0, 2.0))
+                log(f"[get_with_retry] 429 em {a1_range} — aguardando {wait:.1f}s…")
+                time.sleep(wait)
+            else:
+                log(f"[get_with_retry] {code} em {a1_range} — retry {attempt}/{max_tries-1}")
+                _sleep_backoff(attempt, base_sleep)
+    return []
 
-def highlight(ws,start,count,end_col="Q"):
-    if not FORCAR_DESTAQ or count<=0: return
+def load_col_bounded(ws, L, chunk_rows=10000):
+    """
+    Lê uma coluna L a partir da linha 2 até row_count, com fallback em chunks
+    se a leitura inteira falhar.
+    """
+    end_row = max(ws.row_count or 0, 2)
+    if end_row < 2:
+        return []
+    a1 = f"{L}2:{L}{end_row}"
+    try:
+        raw = get_with_retry(ws, a1)
+        return [(r[0].strip() if r and r[0] else "") for r in raw]
+    except APIError as e:
+        log(f"[load_col_bounded] downgrade para chunks ({L}) por erro: {e}")
+        # fallback: ler em pedaços
+        out = []
+        start = 2
+        while start <= end_row:
+            stop = min(end_row, start + chunk_rows - 1)
+            part = get_with_retry(ws, f"{L}{start}:{L}{stop}")
+            out.extend([(r[0].strip() if r and r[0] else "") for r in part])
+            start = stop + 1
+        return out
+
+def load_col(ws, L):
+    """
+    Mantém a assinatura usada no seu código,
+    agora usando a versão delimitada e resiliente.
+    """
+    return load_col_bounded(ws, L)
+
+def highlight(ws, start, count, end_col="Q"):
+    if not FORCAR_DESTAQ or count <= 0: return
     try:
         from gspread_formatting import format_cell_range,CellFormat,Color
         rng=f"A{start}:{end_col}{start+count-1}"
         yellow=CellFormat(backgroundColor=Color(1,1,0.6))
-        with_retry(format_cell_range,ws,rng,yellow,desc=f"highlight {rng}")
+        with_retry(format_cell_range, ws, rng, yellow, desc=f"highlight {rng}")
         log("🎨 Inserções destacadas em amarelo.")
     except Exception as e:
         log(f"⚠️  Falhou ao colorir: {e}")
@@ -120,7 +186,7 @@ b_dst = with_retry(gc.open_by_key, DESTINO_ID, desc="open destino")
 w_src = with_retry(b_src.worksheet, ABA_ORIGEM,  desc="ws origem")
 w_dst = with_retry(b_dst.worksheet, ABA_DESTINO, desc="ws destino")
 
-ensure(w_dst,2,20)  # por causa do status em T2
+ensure(w_dst, 2, 20)  # por causa do status em T2
 
 # ---------- LEITURA ORIGEM ----------
 lastL = col_letter(max(a1index(c) for c in COLS_ORIGEM))
@@ -178,14 +244,17 @@ log("✅ Escrita de Carteira concluída.")
 # ---------- CICLO (E→A F→B C→H L→K D→R) ----------
 log("🔗 CICLO (E→A, F→B, C→H, L→K, D→R)")
 w_ciclo = with_retry(b_dst.worksheet, "CICLO", desc="ws CICLO")
+
+# Leituras resilientes e DELIMITADAS
 E  = load_col(w_ciclo, "E")   # → A (ID/chave)
 F  = load_col(w_ciclo, "F")   # → B
 C  = load_col(w_ciclo, "C")   # → H
-L_ = load_col(w_ciclo, "L")   # → K   (CORRETO)
+L_ = load_col(w_ciclo, "L")   # → K
 D  = load_col(w_ciclo, "D")   # → R (unidade mapeada)
 
-# somente itens que NÃO vieram na etapa anterior (IDs já presentes em A)
-exist = set(r[0].strip() for r in with_retry(w_dst.get, "A2:A", desc="get A2:A") if r and r[0].strip())
+# IDs já existentes (delimitado até o fim atual da planilha de destino)
+exist_A = load_col_bounded(w_dst, "A")
+exist = set(v for v in exist_A if v)
 
 larg  = max(cols0, 18)  # garante até R (col 18 -> idx 17)
 novas = []
@@ -218,12 +287,13 @@ else:
 # ---------- LV CICLO (B→A, C→B, 'SOMENTE LV'→H, Unidade→R) ----------
 log("🔗 LV CICLO (B→A, C→B, 'SOMENTE LV'→H, Unidade→R)")
 w_lv = with_retry(b_dst.worksheet, "LV CICLO", desc="ws LV")
+
 A_uni = load_col(w_lv, "A")   # Unidade (bruta)
 B_id  = load_col(w_lv, "B")   # → A
 C_prj = load_col(w_lv, "C")   # → B
 
-# IDs já existentes (inclui o que veio da etapa principal + CICLO)
-exist = set(r[0].strip() for r in with_retry(w_dst.get, "A2:A", desc="get A2:A again") if r and r[0].strip())
+# Reaproveita o conjunto existente lido antes
+exist = set(exist)  # já contém A2:A do destino
 
 novas_lv=[]; cont={}
 N = max(len(A_uni), len(B_id), len(C_prj))
@@ -258,4 +328,3 @@ else:
 with_retry(w_dst.update, range_name="T2",
            values=[[f"Atualizado em: {now()}"]], value_input_option='USER_ENTERED')
 log(f"🎉 Fim — {rows0} linhas totais inseridas/atualizadas.")
-
