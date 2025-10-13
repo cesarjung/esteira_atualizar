@@ -101,15 +101,17 @@ def chunked_ranges_by_cols(start_col, end_col, start_row, end_row, chunk_cols=4)
         c = c_end + 1
 
 def clear_values_chunked(wks, start_col, end_col, start_row=2, end_row=None, chunk_cols=4, max_attempts=6):
+    """
+    Limpa apenas VALORES em blocos de colunas, usando batch_clear([range]).
+    """
     if end_row is None:
-        # limita ao tamanho da grade; evita varrer infinitamente
         end_row = max(wks.row_count, 1000)
     remove_basic_filter_safe(wks)
     for rng in chunked_ranges_by_cols(start_col, end_col, start_row, end_row, chunk_cols):
         for attempt in range(1, max_attempts + 1):
             try:
-                # Worksheet.clear(range) → values.clear no range
-                gs_retry(wks.clear, rng)
+                # batch_clear aceita lista de ranges A1
+                gs_retry(wks.batch_clear, [rng])
                 break
             except Exception as e:
                 msg = str(e)
@@ -179,7 +181,7 @@ def hard_clear_columns_safe(wks, start_col, end_col, start_row=2, end_row=None,
                             chunk_cols=4, reset_formatting=False):
     """
     Estratégia estável:
-      1) limpa VALORES em blocos pequenos (values.clear)
+      1) limpa VALORES em blocos pequenos (batch_clear)
       2) opcionalmente reseta FORMATAÇÃO também em blocos pequenos
     """
     clear_values_chunked(wks, start_col, end_col, start_row, end_row, chunk_cols)
@@ -207,7 +209,7 @@ if not dados:
         start_row=2,
         end_row=None,
         chunk_cols=4,
-        reset_formatting=False  # ligue True se precisar mesmo zerar formatação
+        reset_formatting=False
     )
     gs_retry(aba_destino.update, range_name='Z1', values=[[f'Atualizado em {agora_str()}']])
     raise SystemExit(0)
@@ -247,21 +249,21 @@ for linha in dados:
 # ATUALIZAÇÃO NA DESTINO
 # =========================
 
-# 1) LIMPEZA ESTÁVEL (substitui batch_clear + updateCells)
+# 1) LIMPEZA ESTÁVEL (substitui batch_clear+updateCells monolítico)
 hard_clear_columns_safe(
     aba_destino,
     DEST_START_NUM,
     DEST_END_NUM,
     start_row=2,
-    end_row=None,     # ou passe um limite calculado (ex.: len(dados)+100) para otimizar
+    end_row=None,     # se quiser otimizar: end_row = len(dados) + 200
     chunk_cols=4,
-    reset_formatting=False  # deixe False; use True só se precisar zerar formatação
+    reset_formatting=False
 )
 
 # 2) Status inicial
 gs_retry(aba_destino.update, range_name='Z1', values=[['Atualizando']])
 
-# 3) Colagem (mantém seu USER_ENTERED)
+# 3) Colagem (mantém USER_ENTERED)
 gs_retry(
     planilha_destino.values_update,
     f"{ABA_DESTINO}!{DEST_START_LET}1",
@@ -276,7 +278,7 @@ if total_rows > lin_fim + 1:
     faixa_sobra = f"{DEST_START_LET}{lin_fim+1}:{DEST_END_LET}{total_rows}"
     gs_retry(aba_destino.batch_clear, [faixa_sobra])
 
-# 5) Formatação opcional (inalterada)
+# 5) Formatação opcional
 if FORCAR_FORMATACAO:
     try:
         num_linhas = len(dados)
