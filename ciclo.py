@@ -4,6 +4,7 @@ import os
 import time
 import re
 import random
+import math
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -55,7 +56,7 @@ def gs_retry(fn, *args, max_tries=6, base_sleep=1.0, **kwargs):
     while True:
         try:
             return fn(*args, **kwargs)
-        except APIError:
+        except APIError as e:
             tentativa += 1
             if tentativa >= max_tries:
                 raise
@@ -66,50 +67,95 @@ def agora_str():
     return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 
 def remove_basic_filter_safe(aba):
-    """Evita 503 clássico quando há filtro básico ativo no sheet."""
+    """Evita 503 quando há filtro básico aplicado na planilha."""
     try:
         aba.clear_basic_filter()
     except Exception:
         pass
 
-def hard_clear_columns(aba, start_col_1based: int, end_col_1based: int, row_chunk: int = 10000, tiny_pause: float = 0.15):
+def hard_clear_columns(aba, start_col_1based: int, end_col_1based: int,
+                       target_batches: int = 6,
+                       max_reqs_per_batch: int = 60,
+                       min_chunk_rows: int = 5000):
     """
-    Limpa de forma 'forçada' os valores (userEnteredValue) em TODAS as linhas
-    entre as colunas start..end (inclusive), preservando a lógica original.
-    Para robustez, faz em CHUNKS de linhas via múltiplos batch_update menores.
+    MESMA SEMÂNTICA DO ORIGINAL:
+      - Limpa userEnteredValue em TODAS as linhas das colunas [start..end] via updateCells.
+
+    ROBUSTEZ/DESEMPENHO:
+      - Divide a grade em ~target_batches blocos grandes (poucas chamadas).
+      - Cada chamada pode enviar vários 'updateCells' (até max_reqs_per_batch).
+      - Se der 503/500 em um lote, esse lote é redividido em blocos menores e reenviado.
     """
     sheet_id = aba._properties['sheetId']
-    total_rows = aba.row_count  # equivalente ao "até o final da grade" do código original
+    total_rows = aba.row_count
+    if total_rows <= 0:
+        return
 
-    # Evita bloqueio por filtro básico
     remove_basic_filter_safe(aba)
 
     start_col_idx = start_col_1based - 1  # zero-based
-    end_col_idx_exclusive = end_col_1based  # exclusivo
+    end_col_idx_exclusive = end_col_1based
 
-    # Varre a grade inteira em janelas de linhas
+    # Tamanho inicial de bloco para ficar próximo do número alvo de chamadas
+    chunk_rows = max(min_chunk_rows, math.ceil(total_rows / max(1, target_batches)))
+
+    # Gera intervalos de linhas cobrindo a grade inteira
+    intervals = []
     r0 = 0
     while r0 < total_rows:
-        r1 = min(total_rows, r0 + row_chunk)  # endRowIndex exclusivo
-        req = {
-            "requests": [{
-                "updateCells": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": r0,
-                        "endRowIndex": r1,
-                        "startColumnIndex": start_col_idx,
-                        "endColumnIndex": end_col_idx_exclusive
-                    },
-                    "fields": "userEnteredValue"
-                }
-            }]
-        }
-        gs_retry(aba.spreadsheet.batch_update, req)
-        # pequeno respiro reduz picos/503 quando a grade é muito grande
-        if tiny_pause:
-            time.sleep(tiny_pause)
+        r1 = min(total_rows, r0 + chunk_rows)
+        intervals.append((r0, r1))
         r0 = r1
+
+    print(f"[hard_clear] total_rows={total_rows} chunk_rows={chunk_rows} grupos_iniciais={len(intervals)}")
+
+    def _build_requests(intervals_subset):
+        return {
+            "requests": [
+                {
+                    "updateCells": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": a,
+                            "endRowIndex": b,
+                            "startColumnIndex": start_col_idx,
+                            "endColumnIndex": end_col_idx_exclusive
+                        },
+                        "fields": "userEnteredValue"
+                    }
+                }
+                for (a, b) in intervals_subset
+            ],
+            "includeSpreadsheetInResponse": False,
+            "responseIncludeGridData": False
+        }
+
+    i = 0
+    # envia em grupos de até 'max_reqs_per_batch' requests por chamada
+    while i < len(intervals):
+        group = intervals[i : i + max_reqs_per_batch]
+        try:
+            gs_retry(aba.spreadsheet.batch_update, _build_requests(group))
+            i += max_reqs_per_batch
+        except APIError as e:
+            msg = str(e)
+            if ("503" in msg) or ("Internal error" in msg) or ("500" in msg):
+                # Reduz o chunk e redivide SOMENTE este grupo
+                current_rows = group[0][1] - group[0][0]
+                new_chunk_rows = max(min_chunk_rows, max(1, current_rows // 2))
+                new_sub = []
+                for (gr0, gr1) in group:
+                    r = gr0
+                    while r < gr1:
+                        r_next = min(gr1, r + new_chunk_rows)
+                        new_sub.append((r, r_next))
+                        r = r_next
+                intervals[i : i + max_reqs_per_batch] = new_sub
+                print(f"[hard_clear] 5xx detectado; reduzindo chunk_rows para {new_chunk_rows} no grupo com {len(group)} reqs → {len(new_sub)} sub-reqs")
+                # tenta novamente com os subpedaços (não avança i)
+                continue
+            else:
+                raise
 
 # === ABERTURA DAS PLANILHAS ===
 planilha_origem  = gs_retry(cliente.open_by_key, ID_ORIGEM)
@@ -161,7 +207,7 @@ for linha in dados:
 
 # 1) LIMPEZA EM CAMADAS (lógica mantida)
 gs_retry(aba_destino.batch_clear, [CLEAR_RANGE])                      # camada 1 (rápida)
-hard_clear_columns(aba_destino, DEST_START_NUM, DEST_END_NUM)         # camada 2 (hard) — agora em chunks de linhas
+hard_clear_columns(aba_destino, DEST_START_NUM, DEST_END_NUM)         # camada 2 (hard) — adaptativo
 
 # 2) Status
 gs_retry(aba_destino.update, range_name='Z1', values=[['Atualizando']])
@@ -222,4 +268,4 @@ if FORCAR_FORMATACAO:
 
 # === FINALIZAR ===
 gs_retry(aba_destino.update, range_name='Z1', values=[[f'Atualizado em {agora_str()}']])
-print(f"✅ CICLO atualizado (limpeza {CLEAR_RANGE} + hard clear (chunked) + pós-clear).")
+print(f"✅ CICLO atualizado (limpeza {CLEAR_RANGE} + hard clear (adaptativo) + pós-clear).")
