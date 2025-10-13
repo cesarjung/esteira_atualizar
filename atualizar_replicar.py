@@ -104,6 +104,9 @@ def _retry_5xx(fn, *args, max_tries=MAX_API_RETRIES, base=BASE_SLEEP, **kwargs):
     raise last
 
 def retry_update(ws, range_name: str, values, value_input_option: str = "USER_ENTERED", desc="update"):
+    """
+    Update com retry. Para 429, usa backoff adicional.
+    """
     attempt = 0
     while True:
         try:
@@ -113,16 +116,22 @@ def retry_update(ws, range_name: str, values, value_input_option: str = "USER_EN
             code = _status_code_from_apierror(e)
             if attempt >= MAX_API_RETRIES or code not in RETRYABLE_CODES:
                 raise
-            print(f"[retry_update] ⚠️ {desc} {range_name}: {e} — retry {attempt}/{MAX_API_RETRIES-1}", flush=True)
-            _sleep_backoff(attempt)
+            # 429 precisa de respiro maior (evita 'per minute per user')
+            if code == 429:
+                wait = min(60.0, 5.0 * attempt + random.uniform(0, 2.0))
+                print(f"[retry_update] ⏳ {desc} {range_name}: 429 rate limit — aguardando {wait:.1f}s (tentativa {attempt})", flush=True)
+                time.sleep(wait)
+            else:
+                print(f"[retry_update] ⚠️ {desc} {range_name}: {e} — retry {attempt}/{MAX_API_RETRIES-1}", flush=True)
+                _sleep_backoff(attempt)
 
 def batch_get_safe(ws, ranges, max_per_call=BATCH_GET_MAX_PER_CALL, max_retries=MAX_API_RETRIES, base_sleep=BASE_SLEEP, desc="batch_get"):
     """
     Mantém a MESMA lógica: ler uma lista de ranges e devolver como ws.batch_get.
     Estratégia robusta contra 503/500/429:
-      1) Tenta em chunks (p.ex. 8..40 ranges por chamada).
-      2) Se 5xx/429, rebaixa para chunk=1 (um range por chamada).
-      3) Se ainda falhar, fallback para ws.get(a1) serial (1 a 1), preservando a ordem.
+      1) Tenta em chunks (≤ max_per_call, começando conservador).
+      2) Se 5xx/429, rebaixa para chunk=1.
+      3) Se ainda falhar, fallback para ws.get(a1) serial, preservando a ordem.
     """
     if not ranges:
         return []
@@ -130,7 +139,6 @@ def batch_get_safe(ws, ranges, max_per_call=BATCH_GET_MAX_PER_CALL, max_retries=
     results = []
     n = len(ranges)
     i = 0
-    # Começa conservador (≤ max_per_call, mas não exagera para evitar URLs enormes)
     cur_chunk = min(max_per_call, 8)
 
     while i < n:
@@ -141,18 +149,15 @@ def batch_get_safe(ws, ranges, max_per_call=BATCH_GET_MAX_PER_CALL, max_retries=
             i += cur_chunk
         except APIError as e:
             code = _status_code_from_apierror(e)
-            msg = str(e)
             if code in RETRYABLE_CODES:
                 if cur_chunk > 1:
-                    # Rebaixa para serial (chunk=1) e tenta novamente sem avançar i
                     print(f"[batch_get_safe] ⚠️ {desc}: {e} — rebaixando para chunk=1 (era {cur_chunk})", flush=True)
                     cur_chunk = 1
                     continue
-                # Já está em chunk=1 e mesmo assim falhou — fallback para ws.get
+                # chunk=1 e ainda falhou → fallback serial
                 a1 = grp[0]
                 try:
                     val = _retry_5xx(ws.get, a1, max_tries=max_retries, base=base_sleep)
-                    # Normaliza para formato batch_get: lista de listas (linhas)
                     results.append(val if isinstance(val, list) else [])
                     i += 1
                 except APIError as e2:
@@ -160,7 +165,6 @@ def batch_get_safe(ws, ranges, max_per_call=BATCH_GET_MAX_PER_CALL, max_retries=
                     results.append([])
                     i += 1
             else:
-                # Erro não retryable: propaga
                 raise
     return results
 
@@ -174,17 +178,18 @@ def get_ws():
     sh = gc.open_by_key(SPREADSHEET_ID)
     return sh.worksheet(BD_CONFIG_SHEET)
 
+# ---- Escrita de status (D/E) em chamada ÚNICA ----
 def set_start(ws, row: int):
-    retry_update(ws, range_name=f"D{row}", values=[["Atualizando"]], desc="set_start D")
-    retry_update(ws, range_name=f"E{row}", values=[[""]], desc="set_start E")
+    # D{row}="Atualizando", E{row}=""
+    retry_update(ws, range_name=f"D{row}:E{row}", values=[["Atualizando", ""]], desc="set_start D:E")
 
 def set_ok(ws, row: int):
-    retry_update(ws, range_name=f"D{row}", values=[[fmt_now()]], desc="set_ok D")
-    retry_update(ws, range_name=f"E{row}", values=[["OK"]], desc="set_ok E")
+    # D{row}=timestamp, E{row}="OK"
+    retry_update(ws, range_name=f"D{row}:E{row}", values=[[fmt_now(), "OK"]], desc="set_ok D:E")
 
 def set_fail(ws, row: int):
-    retry_update(ws, range_name=f"D{row}", values=[[fmt_now()]], desc="set_fail D")
-    retry_update(ws, range_name=f"E{row}", values=[["Falhou"]], desc="set_fail E")
+    # D{row}=timestamp, E{row}="Falhou"
+    retry_update(ws, range_name=f"D{row}:E{row}", values=[[fmt_now(), "Falhou"]], desc="set_fail D:E")
 
 def is_ok_value(v: str) -> bool:
     return (v or "").strip().upper() == "OK"
@@ -258,7 +263,7 @@ def ensure_block(ws, base_dir: Path, steps, idx_offset: int = 0) -> int:
             executed += 1
             run_step(ws, base_dir, script, row, idx_offset + 1, idx_offset + total_planned, attempts[row])
 
-        # FIX: aqui havia um bug (row vs r) — lendo de novo o status com a lista correta de linhas
+        # FIX: releitura correta
         status = get_status_map(ws, [r for _, r in steps])
         if all(is_ok_value(status.get(r, "")) for _, r in steps):
             break
