@@ -6,46 +6,51 @@ import pandas as pd
 import gspread
 from datetime import datetime, date
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
+from gspread.exceptions import APIError, WorksheetNotFound
 from gspread.utils import rowcol_to_a1
 
 # ================== FLAGS ==================
-# Ative se quiser aplicar formato visual (número/data) mesmo com a API oscilando
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
 
 # ================== CONFIG =================
-ID_ORIGEM   = '18-AoLupeaUIOdkW89o6SLK6Z9d8X0dKXgdjft_daMBk'
-ID_DESTINO  = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
-ABA_ORIGEM  = 'Quadro Geral'
-RANGE_ORIGEM = 'B17:M'   # 12 colunas (B..M)
-ABA_DESTINO = 'OPERACAO'
-CAM_CRED    = 'credenciais.json'
+ID_ORIGEM    = '18-AoLupeaUIOdkW89o6SLK6Z9d8X0dKXgdjft_daMBk'
+ID_DESTINO   = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
+ABA_ORIGEM   = 'Quadro Geral'
+RANGE_ORIGEM = 'B17:M'     # 12 colunas (B..M)
+ABA_DESTINO  = 'OPERACAO'
+CAM_CRED     = 'credenciais.json'
 
-CHUNK_ROWS  = 2000
-MAX_RETRIES = 6
+CHUNK_ROWS      = int(os.environ.get("CHUNK_ROWS", "2000"))
+MAX_RETRIES     = 6
+BASE_SLEEP      = 1.0
+TRANSIENT_CODES = {429, 500, 502, 503, 504}
 
 # ================== LOG ====================
 def now(): return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 def log(msg): print(f"[{now()}] {msg}", flush=True)
 
 # ===== RETRY com backoff + jitter ==========
-def with_retries(fn, *args, retries=MAX_RETRIES, base_sleep=1.0, desc="", **kwargs):
+def _status_code(e: APIError):
+    m = re.search(r"\[(\d+)\]", str(e))
+    return int(m.group(1)) if m else None
+
+def with_retries(fn, *args, retries=MAX_RETRIES, base_sleep=BASE_SLEEP, desc="", **kwargs):
     tent = 0
     while True:
         try:
             return fn(*args, **kwargs)
         except APIError as e:
             tent += 1
-            if tent >= retries:
+            code = _status_code(e)
+            if tent >= retries or code not in TRANSIENT_CODES:
                 log(f"❌ Falhou: {desc or fn.__name__} | {e}")
                 raise
-            slp = (base_sleep * (2 ** (tent - 1))) + random.uniform(0, 0.75)
-            log(f"⚠️  {e}. Retry {tent}/{retries-1} em {slp:.1f}s — passo: {desc or fn.__name__}")
-            time.sleep(min(60, slp))
+            slp = min(60, base_sleep * (2 ** (tent - 1)) + random.uniform(0, 0.75))
+            log(f"⚠️  HTTP {code} — retry {tent}/{retries-1} em {slp:.1f}s — passo: {desc or fn.__name__}")
+            time.sleep(slp)
 
 # ============ Helpers de planilha ==========
 def ensure_capacity(ws, min_rows, min_cols):
-    # N1 exige pelo menos 14 colunas (A..N)
     rows = max(ws.row_count, min_rows)
     cols = max(ws.col_count, min_cols)
     if rows != ws.row_count or cols != ws.col_count:
@@ -75,11 +80,12 @@ def update_in_blocks(ws, start_row, start_col, values, block_rows=CHUNK_ROWS):
         end_col = start_col + cols - 1
         rng = f"{rowcol_to_a1(start_row, start_col)}:{rowcol_to_a1(end_row, end_col)}"
         bloco += 1
-        log(f"🚚 Enviando bloco {bloco} — linhas {start_row}..{end_row} de {total}")
+        log(f"🚚 Enviando bloco {bloco} — {rng} ({len(part)} linhas)")
         with_retries(ws.update, values=part, range_name=rng, value_input_option='USER_ENTERED',
                      desc=f"update {rng}")
         i += len(part)
         start_row = end_row + 1
+        time.sleep(0.15)  # suaviza write/min por usuário
     log(f"✅ Upload concluído em {time.time() - t0:.1f}s ({total} linhas)")
 
 # ===== Normalização para API =====
@@ -98,8 +104,7 @@ def normalize_cell(v):
 def to_matrix(df: pd.DataFrame):
     if df.empty:
         return []
-    raw = df.values.tolist()
-    return [[normalize_cell(c) for c in row] for row in raw]
+    return [[normalize_cell(c) for c in row] for row in df.values.tolist()]
 
 # ================== INÍCIO =================
 t0 = time.time()
@@ -116,7 +121,12 @@ log("📂 Abrindo planilhas…")
 plan_origem  = with_retries(gc.open_by_key, ID_ORIGEM,  desc="open_by_key origem")
 plan_destino = with_retries(gc.open_by_key, ID_DESTINO, desc="open_by_key destino")
 aba_origem   = with_retries(plan_origem.worksheet,  ABA_ORIGEM,  desc="worksheet origem")
-aba_destino  = with_retries(plan_destino.worksheet, ABA_DESTINO, desc="worksheet destino")
+try:
+    aba_destino = with_retries(plan_destino.worksheet, ABA_DESTINO, desc="worksheet destino")
+except WorksheetNotFound:
+    log("🆕 Criando aba destino…")
+    aba_destino = with_retries(plan_destino.add_worksheet, title=ABA_DESTINO, rows=1000, cols=14,
+                               desc="add_worksheet destino")
 
 # Garante capacidade para escrever N1 antes do status
 ensure_capacity(aba_destino, min_rows=2, min_cols=14)
@@ -136,12 +146,12 @@ if not dados:
     safe_update(aba_destino, 'N1', [[f'Atualizado em: {now()}']])
     raise SystemExit(0)
 
-# ---- Tratamento: pular cabeçalho ao limpar números/datas
+# ---- Tratamento: D número, E data (pula cabeçalho)
 log("🧽 Tratando colunas (D valor, E data) — ignorando cabeçalho…")
 for i in range(1, len(dados)):  # começa em 1 para não mexer no cabeçalho
     linha = dados[i]
 
-    # D (índice 3 dentro de B..M) -> número
+    # D (índice 3 em B..M) -> número
     if len(linha) > 3:
         bruto = str(linha[3]).replace("’", "").replace("‘", "").replace("'", "")
         bruto = re.sub(r'[^\d.,-]', '', bruto)
@@ -173,11 +183,12 @@ df = pd.DataFrame(dados)  # inclui cabeçalho como 1ª linha
 values = to_matrix(df)
 qtd_linhas = len(values)
 qtd_colunas = len(values[0]) if values else 0
-log(f"📏 Tamanho a escrever: {qtd_linhas} linhas × {qtd_colunas} colunas (vai para A..{chr(64+qtd_colunas)})")
+end_a1 = rowcol_to_a1(1, qtd_colunas).rstrip('1') if qtd_colunas else 'A'
+log(f"📏 Tamanho a escrever: {qtd_linhas} linhas × {qtd_colunas} colunas (vai para A..{end_a1})")
 
 # ---- Capacidade + Limpeza total A2:M
 ensure_capacity(aba_destino, min_rows=qtd_linhas + 2, min_cols=max(14, qtd_colunas))
-safe_clear(aba_destino, "A2:M")  # limpa todas as linhas de A..M, preserva N1
+safe_clear(aba_destino, "A2:M")  # limpa A..M a partir da linha 2 (preserva N1)
 
 # ---- Escrita (A2 em diante), USER_ENTERED
 if qtd_linhas > 0:
