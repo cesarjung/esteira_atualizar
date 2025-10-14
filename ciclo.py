@@ -4,15 +4,16 @@ import os
 import time
 import re
 import random
-import math
 
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
+# =========================
+# FLAGS / CONFIG
+# =========================
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
 
-# === CONFIGURAÇÕES ===
 ID_ORIGEM = '19xV_P6KIoZB9U03yMcdRb2oF_Q7gVdaukjAvE4xOvl8'
 ID_DESTINO = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA_ORIGEM = 'OBRAS GERAL'
@@ -20,7 +21,16 @@ ABA_DESTINO = 'CICLO'
 INTERVALO_ORIGEM = 'A1:T'
 CAMINHO_CREDENCIAIS = 'credenciais.json'
 
-# --- helpers p/ colunas ---
+# limites de chunk
+CHUNK_CLEAR_COLS = 4         # limpar valores em blocos de 4 colunas (batch_clear)
+CHUNK_HARD_ROWS  = 5000      # hard-clear por grupos de linhas
+MAX_RETRIES      = 6
+BASE_SLEEP       = 1.1
+RETRYABLE_CODES  = {429, 500, 502, 503, 504}
+
+# =========================
+# Helpers p/ colunas
+# =========================
 def col_to_num(col: str) -> int:
     n = 0
     for c in col:
@@ -45,131 +55,189 @@ DEST_END_NUM = DEST_START_NUM + SRC_WIDTH - 1
 DEST_END_LET = num_to_col(DEST_END_NUM)
 CLEAR_RANGE = f'{DEST_START_LET}:{DEST_END_LET}'  # ex.: D:W
 
-# === AUTENTICAÇÃO ===
-escopos = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+# =========================
+# AUTENTICAÇÃO
+# =========================
+escopos = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 credenciais = Credentials.from_service_account_file(CAMINHO_CREDENCIAIS, scopes=escopos)
 cliente = gspread.authorize(credenciais)
 
-# ---------- util ----------
-def gs_retry(fn, *args, max_tries=6, base_sleep=1.0, **kwargs):
+# =========================
+# UTIL
+# =========================
+def _status_from_apierror(e: APIError):
+    m = re.search(r"\[(\d+)\]", str(e))
+    return int(m.group(1)) if m else None
+
+def gs_retry(fn, *args, max_tries=MAX_RETRIES, base_sleep=BASE_SLEEP, desc="", **kwargs):
     tentativa = 0
     while True:
         try:
             return fn(*args, **kwargs)
         except APIError as e:
             tentativa += 1
-            if tentativa >= max_tries:
+            code = _status_from_apierror(e)
+            if tentativa >= max_tries or (code is not None and code not in RETRYABLE_CODES):
                 raise
-            slp = (base_sleep * (2 ** (tentativa - 1))) + random.uniform(0, 0.75)
+            slp = min(60.0, (base_sleep * (2 ** (tentativa - 1))) + random.uniform(0, 0.75))
+            if desc:
+                print(f"[retry] ⚠️ {desc}: {e} — retry {tentativa}/{max_tries-1} em {slp:.1f}s", flush=True)
             time.sleep(slp)
 
 def agora_str():
     return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 
-def remove_basic_filter_safe(aba):
-    """Evita 503 quando há filtro básico aplicado na planilha."""
+# =========================
+# Limpeza estável (valores)
+# =========================
+def remove_basic_filter_safe(wks):
     try:
-        aba.clear_basic_filter()
+        wks.clear_basic_filter()
     except Exception:
         pass
 
-def hard_clear_columns(aba, start_col_1based: int, end_col_1based: int,
-                       target_batches: int = 6,
-                       max_reqs_per_batch: int = 60,
-                       min_chunk_rows: int = 5000):
+def chunked_ranges_by_cols(start_col, end_col, start_row, end_row, chunk_cols=CHUNK_CLEAR_COLS):
+    c = start_col
+    while c <= end_col:
+        c_end = min(end_col, c + chunk_cols - 1)
+        col_a = num_to_col(c)
+        col_b = num_to_col(c_end)
+        rng = f"{col_a}{start_row}:{col_b}{end_row}"
+        yield rng
+        c = c_end + 1
+
+def clear_values_chunked(wks, start_col, end_col, start_row=2, end_row=None, chunk_cols=CHUNK_CLEAR_COLS):
     """
-    MESMA SEMÂNTICA DO ORIGINAL:
-      - Limpa userEnteredValue em TODAS as linhas das colunas [start..end] via updateCells.
-
-    ROBUSTEZ/DESEMPENHO:
-      - Divide a grade em ~target_batches blocos grandes (poucas chamadas).
-      - Cada chamada pode enviar vários 'updateCells' (até max_reqs_per_batch).
-      - Se der 503/500 em um lote, esse lote é redividido em blocos menores e reenviado.
+    Limpa apenas VALORES em blocos de colunas, usando batch_clear([range]).
+    Equivale à 1ª camada da sua lógica.
     """
-    sheet_id = aba._properties['sheetId']
-    total_rows = aba.row_count
-    if total_rows <= 0:
-        return
+    if end_row is None:
+        end_row = max(wks.row_count, 1000)
+    remove_basic_filter_safe(wks)
+    for rng in chunked_ranges_by_cols(start_col, end_col, start_row, end_row, chunk_cols):
+        gs_retry(wks.batch_clear, [rng], desc=f"batch_clear {rng}")
 
-    remove_basic_filter_safe(aba)
+# =========================
+# Hard clear adaptativo (userEnteredValue)
+# =========================
+def a1_to_idx(a1):
+    import re as _re
+    def col_to_n(col_letters):
+        col = 0
+        for ch in col_letters:
+            col = col * 26 + (ord(ch.upper()) - ord('A') + 1)
+        return col
+    m = _re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", a1)
+    if not m:
+        raise ValueError(f"Range A1 inválido: {a1}")
+    c1 = col_to_n(m.group(1))
+    r1 = int(m.group(2))
+    c2 = col_to_n(m.group(3))
+    r2 = int(m.group(4))
+    return (r1 - 1, c1 - 1, r2, c2)  # zero-based / end exclusive
 
-    start_col_idx = start_col_1based - 1  # zero-based
-    end_col_idx_exclusive = end_col_1based
+def _sheet_reopen_if_404(wks):
+    """Reabre a worksheet em caso de 404/cache, reduz picos de 5xx na sequência."""
+    try:
+        bk = wks.spreadsheet
+        title = wks.title
+        return gs_retry(bk.worksheet, title, desc=f"reopen {title}")
+    except Exception:
+        return wks  # se falhar, usa o original mesmo
 
-    # Tamanho inicial de bloco para ficar próximo do número alvo de chamadas
-    chunk_rows = max(min_chunk_rows, math.ceil(total_rows / max(1, target_batches)))
+def hard_clear_columns_adapt(wks, start_col, end_col, start_row=2, end_row=None,
+                             chunk_rows=CHUNK_HARD_ROWS):
+    """
+    2ª camada da sua lógica (NÃO removida):
+      - Gera requests updateCells(userEnteredValue) por blocos de linhas × faixa de colunas.
+      - Reabre a worksheet em 404, e dá micro-pausa entre requests para aliviar 503.
+    """
+    if end_row is None:
+        end_row = max(wks.row_count, 1000)
 
-    # Gera intervalos de linhas cobrindo a grade inteira
-    intervals = []
-    r0 = 0
-    while r0 < total_rows:
-        r1 = min(total_rows, r0 + chunk_rows)
-        intervals.append((r0, r1))
-        r0 = r1
+    sheet_id = wks.id
+    c0 = start_col - 1
+    c1 = end_col
 
-    print(f"[hard_clear] total_rows={total_rows} chunk_rows={chunk_rows} grupos_iniciais={len(intervals)}")
+    total_rows = end_row - start_row + 1
+    grupos = max(1, (total_rows + chunk_rows - 1) // chunk_rows)
+    print(f"[hard_clear] total_rows={total_rows} chunk_rows={chunk_rows} grupos_iniciais={grupos}", flush=True)
 
-    def _build_requests(intervals_subset):
-        return {
+    r_start = start_row
+    while r_start <= end_row:
+        r_end = min(end_row, r_start + chunk_rows - 1)
+        r0 = r_start - 1
+        r1 = r_end      # end exclusive
+
+        req = {
             "requests": [
                 {
                     "updateCells": {
                         "range": {
                             "sheetId": sheet_id,
-                            "startRowIndex": a,
-                            "endRowIndex": b,
-                            "startColumnIndex": start_col_idx,
-                            "endColumnIndex": end_col_idx_exclusive
+                            "startRowIndex": r0,
+                            "endRowIndex": r1,
+                            "startColumnIndex": c0,
+                            "endColumnIndex": c1
                         },
                         "fields": "userEnteredValue"
                     }
                 }
-                for (a, b) in intervals_subset
             ],
             "includeSpreadsheetInResponse": False,
-            "responseIncludeGridData": False
+            "responseIncludeGridData": False,
         }
 
-    i = 0
-    # envia em grupos de até 'max_reqs_per_batch' requests por chamada
-    while i < len(intervals):
-        group = intervals[i : i + max_reqs_per_batch]
-        try:
-            gs_retry(aba.spreadsheet.batch_update, _build_requests(group))
-            i += max_reqs_per_batch
-        except APIError as e:
-            msg = str(e)
-            if ("503" in msg) or ("Internal error" in msg) or ("500" in msg):
-                # Reduz o chunk e redivide SOMENTE este grupo
-                current_rows = group[0][1] - group[0][0]
-                new_chunk_rows = max(min_chunk_rows, max(1, current_rows // 2))
-                new_sub = []
-                for (gr0, gr1) in group:
-                    r = gr0
-                    while r < gr1:
-                        r_next = min(gr1, r + new_chunk_rows)
-                        new_sub.append((r, r_next))
-                        r = r_next
-                intervals[i : i + max_reqs_per_batch] = new_sub
-                print(f"[hard_clear] 5xx detectado; reduzindo chunk_rows para {new_chunk_rows} no grupo com {len(group)} reqs → {len(new_sub)} sub-reqs")
-                # tenta novamente com os subpedaços (não avança i)
-                continue
-            else:
-                raise
+        # retry com reabertura defensiva
+        tent = 0
+        while True:
+            try:
+                gs_retry(wks.spreadsheet.batch_update, req, desc=f"hard_clear {r_start}:{r_end}")
+                break
+            except APIError as e:
+                tent += 1
+                code = _status_from_apierror(e)
+                if code == 404 and tent < MAX_RETRIES:
+                    wks = _sheet_reopen_if_404(wks)
+                    time.sleep(0.6)
+                    continue
+                if tent >= MAX_RETRIES or (code is not None and code not in RETRYABLE_CODES):
+                    raise
+                slp = min(60.0, (BASE_SLEEP * (2 ** (tent - 1))) + random.uniform(0, 0.75))
+                print(f"[hard_clear] ⚠️ {e} — retry {tent}/{MAX_RETRIES-1} em {slp:.1f}s (linhas {r_start}-{r_end})", flush=True)
+                time.sleep(slp)
 
-# === ABERTURA DAS PLANILHAS ===
-planilha_origem  = gs_retry(cliente.open_by_key, ID_ORIGEM)
-planilha_destino = gs_retry(cliente.open_by_key, ID_DESTINO)
-aba_origem       = gs_retry(planilha_origem.worksheet, ABA_ORIGEM)
-aba_destino      = gs_retry(planilha_destino.worksheet, ABA_DESTINO)
+        # micro pausa entre blocos do hard-clear
+        time.sleep(0.25)
+        r_start = r_end + 1
 
-# === LER E PROCESSAR DADOS ===
-dados = gs_retry(aba_origem.get, INTERVALO_ORIGEM)
+# =========================
+# ABERTURA DAS PLANILHAS
+# =========================
+planilha_origem  = gs_retry(cliente.open_by_key, ID_ORIGEM, desc="open origem")
+planilha_destino = gs_retry(cliente.open_by_key, ID_DESTINO, desc="open destino")
+aba_origem       = gs_retry(planilha_origem.worksheet, ABA_ORIGEM, desc="ws origem")
+aba_destino      = gs_retry(planilha_destino.worksheet, ABA_DESTINO, desc="ws destino")
+
+# =========================
+# LER E PROCESSAR DADOS
+# =========================
+dados = gs_retry(aba_origem.get, INTERVALO_ORIGEM, desc=f"get {ABA_ORIGEM}!{INTERVALO_ORIGEM}")
 if not dados:
-    # Sem dados: limpa duro e carimba timestamp
-    gs_retry(aba_destino.batch_clear, [CLEAR_RANGE])              # 1) tentativa padrão
-    hard_clear_columns(aba_destino, DEST_START_NUM, DEST_END_NUM) # 2) hard clear (todas as linhas)
-    gs_retry(aba_destino.update, range_name='Z1', values=[[f'Atualizado em {agora_str()}']])
+    # Sem dados: mantém sua limpeza em camadas + timestamp
+    gs_retry(aba_destino.batch_clear, [CLEAR_RANGE], desc=f"clear {CLEAR_RANGE}")
+    hard_clear_columns_adapt(
+        aba_destino,
+        DEST_START_NUM,
+        DEST_END_NUM,
+        start_row=2,
+        end_row=None,
+        chunk_rows=CHUNK_HARD_ROWS
+    )
+    gs_retry(aba_destino.update, range_name='Z1', values=[[f'Atualizado em {agora_str()}']], desc="stamp Z1")
     raise SystemExit(0)
 
 cabecalho = dados[0]
@@ -203,21 +271,42 @@ for linha in dados:
         if idx < len(linha):
             linha[idx] = normalizar_data(linha[idx])
 
-# === ATUALIZAÇÃO NA PLANILHA DESTINO ===
+# =========================
+# ATUALIZAÇÃO NA DESTINO
+# =========================
 
-# 1) LIMPEZA EM CAMADAS (lógica mantida)
-gs_retry(aba_destino.batch_clear, [CLEAR_RANGE])                      # camada 1 (rápida)
-hard_clear_columns(aba_destino, DEST_START_NUM, DEST_END_NUM)         # camada 2 (hard) — adaptativo
+# 1) LIMPEZA EM CAMADAS (mantida)
+# 1.1) batch_clear do intervalo D:W (valores)
+end_row_est = max(aba_destino.row_count, len(dados) + 200)  # evita limpar além do necessário
+clear_values_chunked(
+    aba_destino,
+    DEST_START_NUM,
+    DEST_END_NUM,
+    start_row=2,
+    end_row=end_row_est,
+    chunk_cols=CHUNK_CLEAR_COLS
+)
 
-# 2) Status
-gs_retry(aba_destino.update, range_name='Z1', values=[['Atualizando']])
+# 1.2) hard clear (updateCells userEnteredValue) em blocos de linhas
+hard_clear_columns_adapt(
+    aba_destino,
+    DEST_START_NUM,
+    DEST_END_NUM,
+    start_row=2,
+    end_row=end_row_est,
+    chunk_rows=CHUNK_HARD_ROWS
+)
 
-# 3) Colagem
+# 2) Status inicial
+gs_retry(aba_destino.update, range_name='Z1', values=[['Atualizando']], desc="status Z1")
+
+# 3) Colagem (mantém USER_ENTERED)
 gs_retry(
     planilha_destino.values_update,
     f"{ABA_DESTINO}!{DEST_START_LET}1",
     params={'valueInputOption': 'USER_ENTERED'},
-    body={'values': [cabecalho] + dados}
+    body={'values': [cabecalho] + dados},
+    desc="values_update COLAGEM"
 )
 
 # 4) PÓS-CLEAR (garantir que nada ficou abaixo do novo fim)
@@ -225,47 +314,47 @@ lin_fim = len(dados) + 1  # 1 = cabeçalho
 total_rows = aba_destino.row_count
 if total_rows > lin_fim + 1:
     faixa_sobra = f"{DEST_START_LET}{lin_fim+1}:{DEST_END_LET}{total_rows}"
-    gs_retry(aba_destino.batch_clear, [faixa_sobra])
+    gs_retry(aba_destino.batch_clear, [faixa_sobra], desc=f"post clear {faixa_sobra}")
 
-# --- Formatação opcional ---
+# 5) Formatação opcional (mantida)
 if FORCAR_FORMATACAO:
     try:
         num_linhas = len(dados)
         if num_linhas > 0:
             sheet_id = aba_destino._properties['sheetId']
-            lin_fim_fmt = num_linhas + 1
+            lin_fim = num_linhas + 1
             reqs = {
                 "requests": [
                     # N (idx 13) NUMBER
-                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim_fmt, "startColumnIndex": 13, "endColumnIndex": 14},
+                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim, "startColumnIndex": 13, "endColumnIndex": 14},
                                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
                                     "fields": "userEnteredFormat.numberFormat"}},
                     # O (idx 14) NUMBER
-                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim_fmt, "startColumnIndex": 14, "endColumnIndex": 15},
+                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim, "startColumnIndex": 14, "endColumnIndex": 15},
                                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
                                     "fields": "userEnteredFormat.numberFormat"}},
                     # S (idx 18) NUMBER
-                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim_fmt, "startColumnIndex": 18, "endColumnIndex": 19},
+                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim, "startColumnIndex": 18, "endColumnIndex": 19},
                                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
                                     "fields": "userEnteredFormat.numberFormat"}},
                     # M (idx 12) DATE
-                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim_fmt, "startColumnIndex": 12, "endColumnIndex": 13},
+                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim, "startColumnIndex": 12, "endColumnIndex": 13},
                                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}},
                                     "fields": "userEnteredFormat.numberFormat"}},
                     # P (idx 15) DATE
-                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim_fmt, "startColumnIndex": 15, "endColumnIndex": 16},
+                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim, "startColumnIndex": 15, "endColumnIndex": 16},
                                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}},
                                     "fields": "userEnteredFormat.numberFormat"}},
                     # R (idx 17) DATE
-                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim_fmt, "startColumnIndex": 17, "endColumnIndex": 18},
+                    {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": lin_fim, "startColumnIndex": 17, "endColumnIndex": 18},
                                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}}},
                                     "fields": "userEnteredFormat.numberFormat"}},
                 ]
             }
-            gs_retry(aba_destino.spreadsheet.batch_update, reqs, max_tries=6)
+            gs_retry(aba_destino.spreadsheet.batch_update, reqs, max_tries=MAX_RETRIES, desc="format opcional")
     except APIError as e:
         print(f"[AVISO] Falha na formatação opcional (continua mesmo assim): {e}")
 
-# === FINALIZAR ===
-gs_retry(aba_destino.update, range_name='Z1', values=[[f'Atualizado em {agora_str()}']])
-print(f"✅ CICLO atualizado (limpeza {CLEAR_RANGE} + hard clear (adaptativo) + pós-clear).")
+# 6) FINALIZAR
+gs_retry(aba_destino.update, range_name='Z1', values=[[f'Atualizado em {agora_str()}']], desc="final Z1")
+print(f"✅ CICLO atualizado (limpeza {CLEAR_RANGE} + hard clear (adaptativo) + pós-clear).", flush=True)
