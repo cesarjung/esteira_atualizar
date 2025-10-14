@@ -11,6 +11,8 @@ from gspread.exceptions import APIError
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"  # aplica formato na coluna B
 CHUNK_ROWS        = int(os.environ.get("CHUNK_ROWS", "5000"))        # linhas por bloco no upload
 MAX_RETRIES       = 6
+BASE_SLEEP        = 1.0
+TRANSIENT_CODES   = {429, 500, 502, 503, 504}
 
 # ================== CONFIG ==================
 URL_ORIGEM          = 'https://docs.google.com/spreadsheets/d/189JPWONK4hSpziocviwSQOtj59rWl9tbhkVvrxb6Lds'
@@ -26,18 +28,24 @@ def now(): return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 def log(msg): print(f"[{now()}] {msg}", flush=True)
 
 # ================== RETRY ==================
-def with_retry(fn, *args, desc="", base_sleep=1.0, max_retries=MAX_RETRIES, **kwargs):
+def _status_code(e: APIError):
+    # gspread expõe o código no texto: "APIError: [429]: message..."
+    m = re.search(r"\[(\d+)\]", str(e))
+    return int(m.group(1)) if m else None
+
+def with_retry(fn, *args, desc="", base_sleep=BASE_SLEEP, max_retries=MAX_RETRIES, **kwargs):
     tent = 0
     while True:
         try:
             return fn(*args, **kwargs)
         except APIError as e:
             tent += 1
-            if tent >= max_retries:
+            code = _status_code(e)
+            if tent >= max_retries or code not in TRANSIENT_CODES:
                 log(f"❌ Falhou: {desc or fn.__name__} | {e}")
                 raise
             slp = min(60, base_sleep * (2 ** (tent - 1)) + random.uniform(0, 0.75))
-            log(f"⚠️  {e} — retry {tent}/{max_retries-1} em {slp:.1f}s ({desc or fn.__name__})")
+            log(f"⚠️  HTTP {code} — retry {tent}/{max_retries-1} em {slp:.1f}s ({desc or fn.__name__})")
             time.sleep(slp)
 
 # ================== HELPERS ==================
@@ -64,6 +72,7 @@ def chunked_update(ws, start_row, start_col_letter, end_col_letter, values):
     if n == 0:
         return
     i, bloco = 0, 0
+    t0 = time.time()
     while i < n:
         parte = values[i:i+CHUNK_ROWS]
         a1 = f"{start_col_letter}{start_row + i}:{end_col_letter}{start_row + i + len(parte) - 1}"
@@ -71,6 +80,9 @@ def chunked_update(ws, start_row, start_col_letter, end_col_letter, values):
         log(f"🚚 Bloco {bloco}: {a1} ({len(parte)} linhas)")
         safe_update(ws, a1, parte)
         i += len(parte)
+        # pequena pausa ajuda a não somar com outras gravações simultâneas
+        time.sleep(0.2)
+    log(f"✅ Upload concluído em {time.time() - t0:.1f}s ({n} linhas)")
 
 def parse_valor(s):
     """Converte strings tipo 'R$ 1.234,56' em float 1234.56; vazio se não parseável."""
@@ -79,13 +91,17 @@ def parse_valor(s):
     s = str(s).strip()
     if not s:
         return ""
-    s = re.sub(r'[^\d,.\-]', '', s)  # remove letras, R$, espaços
-    s = s.replace('.', '')           # tira milhar
-    s = s.replace(',', '.')          # vírgula decimal -> ponto
+    # Remove qualquer coisa que não seja dígito, separador decimal ou sinal
+    s = re.sub(r'[^\d,.\-]', '', s)
+    # Milhares: remove pontos quando há vírgula decimal
+    if ',' in s and '.' in s:
+        s = s.replace('.', '')
+    # vírgula decimal -> ponto
+    s = s.replace(',', '.')
     try:
         return float(s)
     except Exception:
-        return ""  # evita lixo
+        return ""  # mantém célula vazia em caso de lixo
 
 # ================== INÍCIO ==================
 log("🟢 INÍCIO: copiar A,B (Código/Valor) → BD_EXEC!A,B + status em E2")
@@ -103,7 +119,12 @@ aba_origem      = with_retry(planilha_origem.worksheet, NOME_ABA_ORIGEM, desc="w
 
 log("📂 Abrindo destino por ID…")
 planilha_destino = with_retry(gc.open_by_key, ID_PLANILHA_DESTINO, desc="open_by_key destino")
-aba_destino      = with_retry(planilha_destino.worksheet, NOME_ABA_DESTINO, desc="worksheet destino")
+try:
+    aba_destino = with_retry(planilha_destino.worksheet, NOME_ABA_DESTINO, desc="worksheet destino")
+except gspread.WorksheetNotFound:
+    log("🆕 Criando aba destino…")
+    aba_destino = with_retry(planilha_destino.add_worksheet, title=NOME_ABA_DESTINO, rows=1000, cols=5,
+                             desc="add_worksheet destino")
 
 # Garante pelo menos colunas até E (status) e B (dados)
 ensure_size(aba_destino, min_rows=2, min_cols=5)
