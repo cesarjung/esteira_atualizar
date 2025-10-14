@@ -19,16 +19,20 @@ ABA_DESTINO = 'zps'
 EMPRESAS = ['SINO ELETRICIDADE LTDA', 'SIRTEC SISTEMAS ELÉTRICOS LTDA.']
 
 # Tuning
-BLOCK_ROWS = 2000     # linhas por bloco no upload
-MAX_RETRIES = 6       # tentativas para chamadas HTTP
-BASE_SLEEP = 1.0      # backoff base
+BLOCK_ROWS = 2000          # linhas por bloco lógico
+BATCH_GROUP = 8            # quantos blocos vão juntos num values.batchUpdate
+MAX_RETRIES = 6
+BASE_SLEEP = 1.0
 
 # ========= LOG =========
 def now(): return datetime.now().strftime("%H:%M:%S")
 def log(msg): print(f"[{now()}] {msg}", flush=True)
 
 # ========= RETRY =========
-TRANSIENT_CODES = {429, 500, 503}
+TRANSIENT_CODES = {429, 500, 502, 503, 504}
+
+def _status(e: HttpError):
+    return getattr(e, "resp", None).status if getattr(e, "resp", None) else None
 
 def with_retry(callable_fn, *args, desc="", **kwargs):
     attempt = 0
@@ -36,7 +40,7 @@ def with_retry(callable_fn, *args, desc="", **kwargs):
         try:
             return callable_fn(*args, **kwargs)
         except HttpError as e:
-            status = getattr(e, "resp", None).status if getattr(e, "resp", None) else None
+            status = _status(e)
             attempt += 1
             if status in TRANSIENT_CODES and attempt < MAX_RETRIES:
                 sleep_s = min(60, BASE_SLEEP * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
@@ -53,6 +57,34 @@ creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPE
 drive_service = build('drive', 'v3', credentials=creds)
 sheets_service = build('sheets', 'v4', credentials=creds)
 
+def get_sheet_id(spreadsheet_id: str, title: str) -> int | None:
+    info = with_retry(
+        sheets_service.spreadsheets().get,
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))",
+        desc="spreadsheets.get(sheetId)"
+    ).execute()
+    for sh in info.get("sheets", []):
+        props = sh.get("properties", {})
+        if props.get("title") == title:
+            return props.get("sheetId")
+    return None
+
+def clear_basic_filter(sheet_id: int | None):
+    if not sheet_id:
+        return
+    body = {"requests": [{"clearBasicFilter": {"sheetId": sheet_id}}]}
+    try:
+        with_retry(
+            sheets_service.spreadsheets().batchUpdate,
+            spreadsheetId=SPREADSHEET_ID,
+            body=body,
+            desc="batchUpdate(clearBasicFilter)"
+        ).execute()
+    except HttpError:
+        # filtro pode não existir — ignorar
+        pass
+
 # ========= BUSCA DO ARQUIVO =========
 log("📥 Procurando BANCO.xlsx mais recente…")
 resp = with_retry(
@@ -64,7 +96,7 @@ resp = with_retry(
     orderBy='modifiedTime desc',
     supportsAllDrives=True,
     includeItemsFromAllDrives=True,
-    pageSize=1,  # pega só o mais recente
+    pageSize=1,
     desc="files.list(BANCO.xlsx)"
 ).execute()
 
@@ -100,7 +132,7 @@ while not done:
                     log(f"   ↳ Progresso: {pct:3d}%")
                 last_pct = pct
     except HttpError as e:
-        code = getattr(e, "resp", None).status if getattr(e, "resp", None) else None
+        code = _status(e)
         if code in TRANSIENT_CODES:
             sleep_s = min(60, BASE_SLEEP + random.uniform(0, 0.75))
             log(f"⚠️  HTTP {code} durante download. Pausando {sleep_s:.1f}s e retomando…")
@@ -114,7 +146,7 @@ log(f"✅ Download concluído em {time.time() - t0_dl:.1f}s")
 # ========= LEITURA DO EXCEL =========
 log("📊 Lendo planilha Excel em memória…")
 t0_read = time.time()
-df = pd.read_excel(file_stream, engine='openpyxl')  # mantém compatibilidade atual
+df = pd.read_excel(file_stream, engine='openpyxl')
 colunas_originais = df.columns
 log(f"🧮 Linhas totais no arquivo: {len(df)} (leitura em {time.time() - t0_read:.1f}s)")
 
@@ -132,6 +164,7 @@ log("🔎 Filtrando por empresas na coluna J…")
 df_filtrado = df_sem_transp[df_sem_transp.iloc[:, 9].astype(str).isin(EMPRESAS)].copy()
 if df_filtrado.empty:
     log("⚠️  Nenhuma linha válida após filtros. Limpando aba e saindo.")
+    # limpa e timestamp
     with_retry(
         sheets_service.spreadsheets().values().clear,
         spreadsheetId=SPREADSHEET_ID, range=ABA_DESTINO,
@@ -167,12 +200,14 @@ df_final = pd.DataFrame({
     colunas_originais[26]: col_AA,
     colunas_originais[27]: col_AB,
 })
-
 # Colunas derivadas H e I a partir de B
 df_final['H'] = df_final['B'].astype(str).str[0]
 df_final['I'] = df_final['B'].astype(str).str[-7:]
 
-# ========= LIMPEZA NA ABA =========
+# ========= LIMPEZA + ANTI-FILTRO =========
+sheet_id = get_sheet_id(SPREADSHEET_ID, ABA_DESTINO)
+clear_basic_filter(sheet_id)
+
 log("🧽 Limpando conteúdo da aba (zps)…")
 with_retry(
     sheets_service.spreadsheets().values().clear,
@@ -181,8 +216,8 @@ with_retry(
     desc="values.clear(zps)"
 ).execute()
 
-# ========= UPLOAD (em blocos) =========
-log("📤 Enviando dados para a aba (em blocos)…")
+# ========= UPLOAD (lotes via values.batchUpdate) =========
+log("📤 Enviando dados para a aba (em blocos agregados)…")
 valores = [df_final.columns.tolist()] + df_final.values.tolist()
 total = len(valores)
 if total == 0:
@@ -198,28 +233,49 @@ else:
         desc="values.update(cabecalho)"
     ).execute()
 
-    # Dados em blocos
+    # Dados: blocos de BLOCK_ROWS, agrupados em lotes de BATCH_GROUP por chamada
     t0_up = time.time()
     i = 1
     bloco = 0
+    pending_ranges = []
+
+    def flush_batch():
+        nonlocal pending_ranges
+        if not pending_ranges:
+            return
+        body = {
+            "valueInputOption": "USER_ENTERED",
+            "data": pending_ranges,
+            "includeValuesInResponse": False
+        }
+        with_retry(
+            sheets_service.spreadsheets().values().batchUpdate,
+            spreadsheetId=SPREADSHEET_ID,
+            body=body,
+            desc=f"values.batchUpdate({len(pending_ranges)} ranges)"
+        ).execute()
+        pending_ranges = []
+
     while i < total:
         parte = valores[i:i+BLOCK_ROWS]
-        start_row = i + 1   # +1 porque a primeira linha é o cabeçalho em A1
+        start_row = i + 1
         end_row   = i + len(parte)
         range_a1 = f"{ABA_DESTINO}!A{start_row}"
         bloco += 1
         log(f"   ↳ Bloco {bloco}: linhas {start_row}..{end_row} ({len(parte)} linhas)")
-
-        with_retry(
-            sheets_service.spreadsheets().values().update,
-            spreadsheetId=SPREADSHEET_ID,
-            range=range_a1,
-            valueInputOption="USER_ENTERED",
-            body={"values": parte},
-            desc=f"values.update({range_a1})"
-        ).execute()
+        pending_ranges.append({
+            "range": range_a1,
+            "majorDimension": "ROWS",
+            "values": parte
+        })
         i += len(parte)
 
+        if len(pending_ranges) >= BATCH_GROUP:
+            flush_batch()
+            # pequena pausa para aliviar writes/min combinados com outros scripts
+            time.sleep(0.4)
+
+    flush_batch()
     log(f"✅ Upload concluído em {time.time() - t0_up:.1f}s ({total-1} linhas de dados)")
 
 # ========= TIMESTAMP =========
