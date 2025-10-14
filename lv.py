@@ -6,7 +6,7 @@ import pandas as pd
 import gspread
 from datetime import datetime
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
+from gspread.exceptions import APIError, WorksheetNotFound
 
 # ====== FLAG: formatação opcional (desligada por padrão) ======
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
@@ -22,6 +22,8 @@ CAM_CRED      = 'credenciais.json'
 
 CHUNK_ROWS    = 2000
 MAX_RETRIES   = 6
+BASE_SLEEP    = 1.1
+RETRYABLE     = {429, 500, 502, 503, 504}
 
 # ====== LOG ======
 def now_str():
@@ -30,35 +32,47 @@ def now_str():
 def log(msg):
     print(f"[{now_str()}] {msg}", flush=True)
 
+def _status_from_apierror(e: APIError):
+    m = re.search(r"\[(\d+)\]", str(e))
+    return int(m.group(1)) if m else None
+
 # ====== AUTENTICAÇÃO ======
 escopos = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 cred = Credentials.from_service_account_file(CAM_CRED, scopes=escopos)
 gc = gspread.authorize(cred)
 
 # ====== RETRY COM BACKOFF + JITTER ======
-def with_retry(fn, *args, max_retries=MAX_RETRIES, base_sleep=1.0, desc="", **kwargs):
+def with_retry(fn, *args, max_retries=MAX_RETRIES, base_sleep=BASE_SLEEP, desc="", **kwargs):
     tent = 0
     while True:
         try:
             return fn(*args, **kwargs)
         except APIError as e:
             tent += 1
-            if tent >= max_retries:
+            code = _status_from_apierror(e)
+            if tent >= max_retries or (code is not None and code not in RETRYABLE):
                 log(f"❌ Falhou: {desc or fn.__name__} | {e}")
                 raise
-            sleep_s = (base_sleep * (2 ** (tent - 1))) + random.uniform(0, 0.75)
-            log(f"⚠️  Erro API ({e}). Retry {tent}/{max_retries-1} em {sleep_s:.1f}s — passo: {desc or fn.__name__}")
-            time.sleep(min(60, sleep_s))
+            sleep_s = min(60.0, (base_sleep * (2 ** (tent - 1))) + random.uniform(0, 0.75))
+            log(f"⚠️  {e} — retry {tent}/{max_retries-1} em {sleep_s:.1f}s — {desc or fn.__name__}")
+            time.sleep(sleep_s)
 
 def ensure_size(ws, rows, cols):
     rows = max(rows, 2)
-    cols = max(cols, 26)  # <<< garante coluna Z
+    cols = max(cols, 26)  # garante coluna Z
     if ws.row_count < rows or ws.col_count < cols:
         log(f"🧩 Ajustando grade: linhas {ws.row_count}->{rows}, colunas {ws.col_count}->{cols}")
-        with_retry(ws.resize, rows, cols, desc="resize planilha destino")
+        with_retry(ws.resize, rows, cols, desc="resize destino")
+
+def remove_basic_filter_safe(ws):
+    try:
+        ws.clear_basic_filter()
+    except Exception:
+        pass
 
 def safe_clear(ws, a1):
     log(f"🧹 Limpando intervalo {a1}")
+    remove_basic_filter_safe(ws)
     with_retry(ws.batch_clear, [a1], desc=f"batch_clear {a1}")
 
 def safe_update(ws, a1, values):
@@ -80,30 +94,50 @@ def chunked_update(ws, values, start_row=1, start_col='A', end_col='Y'):
         i += len(part)
     log(f"✅ Upload concluído em {time.time() - t0:.1f}s ({n} linhas)")
 
+def reopen_ws_if_404(book, title, ws, desc="reopen ws"):
+    """Reabre a worksheet em caso de 404 (cache/propagação)."""
+    try:
+        return with_retry(book.worksheet, title, desc=desc)
+    except Exception:
+        return ws
+
 # ====== ABERTURA ======
 log("🟢 INÍCIO LV CICLO")
 t0_total = time.time()
 
 log("📂 Abrindo planilha origem/destino…")
-ws_src = with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem").worksheet(ABA_ORIGEM)
+book_src = with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem")
 book_dst = with_retry(gc.open_by_key, ID_DESTINO, desc="open_by_key destino")
+
 try:
-    ws_dst = with_retry(book_dst.worksheet, ABA_DESTINO, desc="abrir worksheet destino")
-except gspread.WorksheetNotFound:
+    ws_src = with_retry(book_src.worksheet, ABA_ORIGEM, desc="abrir ws origem")
+except WorksheetNotFound:
+    log("❌ Aba de origem não encontrada."); raise
+
+try:
+    ws_dst = with_retry(book_dst.worksheet, ABA_DESTINO, desc="abrir ws destino")
+except WorksheetNotFound:
     log("🆕 Criando aba destino…")
     ws_dst = with_retry(book_dst.add_worksheet, title=ABA_DESTINO, rows=1000, cols=26,
                         desc="criar worksheet destino")
 
-# Garante pelo menos 26 colunas (para poder usar Z1) ANTES do primeiro status
+# Garante tamanho antes do primeiro status
 ensure_size(ws_dst, ws_dst.row_count, 26)
 
 # ====== TIMESTAMP INICIAL ======
 log("🏷️  Marcando status inicial em Z1…")
-safe_update(ws_dst, 'Z1', [['Atualizando...']])
+try:
+    safe_update(ws_dst, 'Z1', [['Atualizando...']])
+except APIError as e:
+    if _status_from_apierror(e) == 404:
+        ws_dst = reopen_ws_if_404(book_dst, ABA_DESTINO, ws_dst, desc="reopen destino p/ Z1")
+        safe_update(ws_dst, 'Z1', [['Atualizando...']])
+    else:
+        raise
 
 # ====== LEITURA ======
 log(f"📥 Lendo dados da origem ({ABA_ORIGEM}!{RANGE_ORIGEM})…")
-dados = with_retry(ws_src.get, RANGE_ORIGEM, desc="get origem")
+dados = with_retry(ws_src.get, RANGE_ORIGEM, desc=f"get {ABA_ORIGEM}!{RANGE_ORIGEM}")
 df = pd.DataFrame(dados)
 log(f"🔎 Linhas lidas (inclui cabeçalho): {len(df)}")
 
@@ -119,7 +153,7 @@ log("🧽 Tratando colunas numéricas e data…")
 num_cols = [5, 10, 19, 21, 22]  # F, K, T, V, W (0-based)
 date_col = 7                     # H (0-based)
 
-# Números
+# Números (linhas a partir da 2)
 for c in num_cols:
     if c < df.shape[1]:
         s = (df.iloc[1:, c].astype(str)
@@ -131,7 +165,7 @@ for c in num_cols:
              .str.replace(",", ".", regex=False))
         df.iloc[1:, c] = pd.to_numeric(s, errors='coerce')
 
-# Datas -> string dd/mm/yyyy (USER_ENTERED interpreta)
+# Datas
 if date_col < df.shape[1]:
     serie = (df.iloc[1:, date_col].astype(str)
              .str.replace("’", "", regex=False)
@@ -150,7 +184,14 @@ log(f"📏 Tamanho a escrever: {n_rows} linhas × 25 colunas (A:Y)")
 ensure_size(ws_dst, n_rows, 26)  # mantém Z disponível
 
 # Limpa A:Y (preserva Z1)
-safe_clear(ws_dst, "A:Y")
+try:
+    safe_clear(ws_dst, "A:Y")
+except APIError as e:
+    if _status_from_apierror(e) == 404:
+        ws_dst = reopen_ws_if_404(book_dst, ABA_DESTINO, ws_dst, desc="reopen destino p/ clear")
+        safe_clear(ws_dst, "A:Y")
+    else:
+        raise
 
 # Converte DF e envia em blocos
 values = df.values.tolist()
@@ -211,6 +252,13 @@ if FORCAR_FORMATACAO and n_rows > 1:
 
 # ====== TIMESTAMP FINAL ======
 log("🏁 Gravando timestamp final em Z1…")
-safe_update(ws_dst, 'Z1', [[f'Atualizado em {now_str()}']])
+try:
+    safe_update(ws_dst, 'Z1', [[f'Atualizado em {now_str()}']])
+except APIError as e:
+    if _status_from_apierror(e) == 404:
+        ws_dst = reopen_ws_if_404(book_dst, ABA_DESTINO, ws_dst, desc="reopen destino p/ Z1 final")
+        safe_update(ws_dst, 'Z1', [[f'Atualizado em {now_str()}']])
+    else:
+        raise
 
 log(f"🎉 LV CICLO concluído em {time.time() - t0_total:.1f}s  (formatação opcional: {'ON' if FORCAR_FORMATACAO else 'OFF'})")
