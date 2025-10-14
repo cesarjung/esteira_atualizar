@@ -1,8 +1,11 @@
-# replicar_carteira.py — resiliente, sem pular destino; números contáveis e formatações opcionais
+# replicar_carteira.py — resiliente, sem pular destino; garante T2; retries/backoff; números opcionais
+
 from datetime import datetime
 import re
 import time
 import sys
+import os, json, pathlib
+import random
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, WorksheetNotFound
@@ -14,10 +17,10 @@ except Exception:
     CellFormat = None
     NumberFormat = None
 
-# === CONFIGURAÇÕES ===
+# === CONFIG ===
 ID_MASTER = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
-ABA = 'Carteira'
-DESTINOS = [
+ABA       = 'Carteira'
+DESTINOS  = [
     '1zIfub-pAVtZGSjYT1Qa7HzjAof56VExU7U5WwLE382c',
     '1NL6fGUhJyde7_ttTkWRVxg78mAOw8Z5W-LBesK_If_M',
     '10Y7VKFsn-UKgMqpM63LiUD2N9_XmfSr29CuK3mq84_c',
@@ -26,68 +29,87 @@ DESTINOS = [
 
 ESCOPOS = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
-# === AUTENTICAÇÃO (portável) ===
-import os, json, pathlib
+# === FLAGS / TUNING ===
+APLICAR_FORMATACAO_NUMERICA = False             # desligado para evitar quota
+CHUNK_ROWS                  = int(os.environ.get("CHUNK_ROWS", "4000"))
+MAX_RETRIES                 = 6
+BASE_SLEEP                  = 1.0               # base para backoff
+PAUSE_BETWEEN_WRITES        = 0.12              # pequenas pausas aliviam write/min
+COLS_MIN                    = 20                # garante até T (A..T) p/ carimbo T2
+
+# === AUTH portável (env GOOGLE_CREDENTIALS ou arquivo local) ===
 def make_creds():
     env = os.environ.get('GOOGLE_CREDENTIALS')
     if env:
         return Credentials.from_service_account_info(json.loads(env), scopes=ESCOPOS)
     return Credentials.from_service_account_file(pathlib.Path('credenciais.json'), scopes=ESCOPOS)
 
-# === OPÇÕES ===
-APLICAR_FORMATACAO_NUMERICA = False    # desligado para evitar quota/503
-TENTATIVAS_MAX = 3                     # tentativas para cada script
-ATRASO_BASE = 5.0                      # atraso base entre tentativas
-
-# === AJUDA ===
-def a1(col, row):
-    """Converte (col, row) 1-based para A1."""
-    letras = ""
-    while col > 0:
-        col, rem = divmod(col - 1, 26)
-        letras = chr(65 + rem) + letras
-    return f"{letras}{row}"
-
+# === UTILS ===
 def agora():
     return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 
-def ler_master_A_S():
-    """Lê do master (aba Carteira) o intervalo A1:S (cabeçalho + dados)."""
-    # === AUTENTICAÇÃO ===
-    creds = make_creds()
-    gc = gspread.authorize(creds)
+def a1(col, row):
+    """Converte (col, row) 1-based para A1."""
+    letras = ""
+    c = col
+    while c > 0:
+        c, rem = divmod(c - 1, 26)
+        letras = chr(65 + rem) + letras
+    return f"{letras}{row}"
 
-    print(f"📖 Abrindo master {ID_MASTER} / aba {ABA} …")
-    sh = gc.open_by_key(ID_MASTER)
-    ws = sh.worksheet(ABA)
+def _status_code(e: APIError):
+    m = re.search(r"\[(\d{3})\]", str(e))
+    try:
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
 
-    # lê cabeçalho + dados
-    intervalo = "A1:S"
-    valores = ws.get(intervalo)
-    if not valores:
-        return [], []
+TRANSIENT = {429, 500, 502, 503, 504}
 
-    cabecalho = valores[0]
-    dados = valores[1:]
-    print(f"✅ Master lido: {len(dados)} linhas.")
-    return cabecalho, dados
+def with_retry(fn, *args, desc="", **kwargs):
+    for tent in range(1, MAX_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            code = _status_code(e)
+            if code not in TRANSIENT or tent >= MAX_RETRIES:
+                print(f"❌ {desc or fn.__name__} falhou: {e}")
+                raise
+            slp = min(60, BASE_SLEEP * (2 ** (tent - 1)) + random.uniform(0, 0.75))
+            print(f"⚠️  {desc or fn.__name__}: HTTP {code} — retry {tent}/{MAX_RETRIES-1} em {slp:.1f}s")
+            time.sleep(slp)
 
+def ensure_grid(ws, min_rows, min_cols):
+    rows = max(ws.row_count, min_rows)
+    cols = max(ws.col_count, min_cols)
+    if rows != ws.row_count or cols != ws.col_count:
+        print(f"🧩 resize {ws.title}: {ws.row_count}x{ws.col_count} → {rows}x{cols}")
+        with_retry(ws.resize, rows=rows, cols=cols, desc=f"resize {ws.title}")
+
+def values_clear(ws, a1_range, tag="values_clear"):
+    with_retry(ws.spreadsheet.values_clear, a1_range, desc=tag)
+    time.sleep(PAUSE_BETWEEN_WRITES)
+
+def safe_update(ws, a1_range, values, user_entered=True, tag="update"):
+    opt = "USER_ENTERED" if user_entered else "RAW"
+    with_retry(ws.update, range_name=a1_range, values=values, value_input_option=opt, desc=tag)
+    time.sleep(PAUSE_BETWEEN_WRITES)
+
+# === CONVERSÕES NUMÉRICAS (opcional) ===
 def converter_numeros(dados, colunas_numericas):
-    """Converte strings para números (float) nas colunas indicadas (1-based)."""
+    """Converte strings para float nas colunas 1-based de 'dados'."""
     def conv(v):
         if v is None:
             return None
         s = str(v).strip()
         if s == "":
             return None
-        # remove símbolos comuns
-        s = s.replace("R$", "").replace(".", "").replace(" ", "").replace("\u00a0", "")
-        s = s.replace(",", ".")
+        s = s.replace("R$", "").replace("\u00a0", "").replace(" ", "")
+        s = s.replace(".", "").replace(",", ".")
         try:
             return float(s)
         except Exception:
-            return v  # mantém original
-
+            return v
     out = []
     for row in dados:
         new = list(row)
@@ -99,7 +121,7 @@ def converter_numeros(dados, colunas_numericas):
     return out
 
 def aplicar_formatacao(ws, colunas_numericas):
-    """Aplica NumberFormat padrão moeda/numero nas colunas passadas (1-based)."""
+    """Aplica NumberFormat padrão decimal nas colunas (1-based). Fail-soft."""
     if not APLICAR_FORMATACAO_NUMERICA or not format_cell_range or not NumberFormat or not CellFormat:
         return
     try:
@@ -108,79 +130,95 @@ def aplicar_formatacao(ws, colunas_numericas):
             fmt = CellFormat(numberFormat=NumberFormat(type='NUMBER', pattern='0.00'))
             format_cell_range(ws, rng, fmt)
     except Exception as e:
-        print(f"⚠️  Falhou formatacao numerica: {e}")
+        print(f"⚠️  Formatação numérica ignorada: {e}")
 
+# === LEITURA MASTER ===
+def ler_master_A_S():
+    """Lê master (Carteira) A1:S (cabeçalho + dados)."""
+    gc = gspread.authorize(make_creds())
+    print(f"📖 Abrindo master {ID_MASTER}/{ABA} …")
+    sh = with_retry(gc.open_by_key, ID_MASTER, desc="open_by_key master")
+    ws = with_retry(sh.worksheet, ABA, desc="worksheet master")
+    valores = with_retry(ws.get, "A1:S", desc="get A1:S") or []
+    if not valores:
+        return [], []
+    cabecalho = valores[0]
+    dados = valores[1:]
+    print(f"✅ Master lido: {len(dados)} linhas.")
+    return cabecalho, dados
+
+# === ESCRITA DESTINO ===
 def limpar_e_escrever_destino(planilha_id, cabecalho, dados):
-    """Limpa e escreve A:S no destino, preservando cabeçalho."""
-    creds = make_creds()
-    gc = gspread.authorize(creds)
+    """Limpa e escreve A:S no destino, garante grade até T2 p/ carimbo."""
+    gc = gspread.authorize(make_creds())
     print(f"📦 Abrindo destino {planilha_id} …")
-    sh = gc.open_by_key(planilha_id)
+    sh = with_retry(gc.open_by_key, planilha_id, desc=f"open_by_key {planilha_id}")
     try:
-        ws = sh.worksheet(ABA)
+        ws = with_retry(sh.worksheet, ABA, desc=f"worksheet {ABA}")
     except WorksheetNotFound:
-        # cria se não existir
-        ws = sh.add_worksheet(title=ABA, rows=2000, cols=60)
+        ws = with_retry(sh.add_worksheet, title=ABA, rows=max(len(dados) + 2, 1000), cols=max(COLS_MIN, 60),
+                        desc=f"add_worksheet {ABA}")
 
-    # garante dimensões mínimas
-    if ws.row_count < len(dados) + 2 or ws.col_count < 19:
-        alvo_linhas = max(ws.row_count, len(dados) + 2)
-        alvo_cols = max(ws.col_count, 19)
-        print(f"🧩 resize {ws.title} → {alvo_linhas} x {alvo_cols}")
-        ws.resize(alvo_linhas, alvo_cols)
+    # Garante dimensões: dados + T (col 20) para timestamp
+    min_rows = max(2 + len(dados), 2)
+    ensure_grid(ws, min_rows=min_rows, min_cols=COLS_MIN)  # >= 20 colunas (A..T)
 
-    # limpa A2:S
+    # Status inicial (T2 combina com importador)
+    try:
+        safe_update(ws, 'T2', [['Atualizando...']], user_entered=False, tag='status T2')
+    except Exception as e:
+        print(f"⚠️  Não foi possível marcar status em T2: {e}")
+
+    # Limpa A2:S (todo o corpo)
     print("🧽 Limpando dados antigos (A2:S)…")
-    ws.batch_clear(['A2:S'])
+    values_clear(ws, f"'{ws.title}'!A2:S", tag='values_clear A2:S')
 
-    # escreve cabeçalho (A1:S1)
-    print("📝 Escrevendo cabeçalho…")
-    ws.update(range_name='A1:S1', values=[cabecalho], value_input_option='USER_ENTERED')
+    # Cabeçalho
+    print("📝 Escrevendo cabeçalho (A1:S1)…")
+    safe_update(ws, 'A1:S1', [cabecalho], user_entered=True, tag='update header A1:S1')
 
-    # conversão de colunas possivelmente numéricas
-    colunas_numericas = [12, 13, 14, 15, 16, 17]  # exemplo, ajuste se necessário
-    dados_fmt = converter_numeros(dados, colunas_numericas)
+    # Conversão numérica (ajuste se necessário)
+    colunas_numericas = [12, 13, 14, 15, 16, 17]  # L..Q originais; mantenho sua seleção
+    dados_fmt = converter_numeros(dados, colunas_numericas) if APLICAR_FORMATACAO_NUMERICA else dados
 
-    # escreve dados em blocos
-    print(f"🚚 Escrevendo {len(dados_fmt)} linhas em blocos…")
-    CHUNK = 4000
-    ini = 0
-    while ini < len(dados_fmt):
-        parte = dados_fmt[ini:ini+CHUNK]
-        rng = f"A{2+ini}:{a1(19, 1+ini+len(parte))}"
-        ws.update(range_name=rng, values=parte, value_input_option='USER_ENTERED')
-        ini += len(parte)
+    # Escrita em blocos
+    print(f"🚚 Escrevendo {len(dados_fmt)} linhas em blocos de {CHUNK_ROWS}…")
+    i = 0
+    while i < len(dados_fmt):
+        parte = dados_fmt[i:i + CHUNK_ROWS]
+        start = 2 + i
+        end   = 1 + i + len(parte)  # 2..(1+len) cobre 'len(parte)' linhas
+        rng   = f"A{start}:{a1(19, end)}"  # 19 = S
+        safe_update(ws, rng, parte, user_entered=True, tag=f'update {rng}')
+        i += len(parte)
 
-    # formatação numérica (opcional)
+    # Formatação numérica opcional
     aplicar_formatacao(ws, colunas_numericas)
 
-    # timestamp
+    # Timestamp final em T2
     try:
-        ws.update(range_name='T2', values=[[f"Replicado em: {agora()}"]], value_input_option='USER_ENTERED')
-    except Exception:
-        pass
+        safe_update(ws, 'T2', [[f"Replicado em: {agora()}"]], user_entered=True, tag='timestamp T2')
+    except Exception as e:
+        print(f"⚠️  Falha ao gravar timestamp em T2: {e}")
 
     print(f"✅ Finalizado destino {planilha_id}")
 
 def tentar_destino_ate_dar_certo(planilha_id, cabecalho, dados):
-    """Tenta replicar um destino com retries, sem pular em caso de erro transitório."""
+    """Replica com retries de alto nível por destino (sem pular)."""
     for tentativa in range(1, 6):
         try:
+            if tentativa > 1:
+                atraso = min(60, BASE_SLEEP * (2 ** (tentativa - 1)) + 0.3 * tentativa)
+                print(f"🔁 Tentativa {tentativa}/5 para {planilha_id} — aguardando {atraso:.1f}s…")
+                time.sleep(atraso)
             limpar_e_escrever_destino(planilha_id, cabecalho, dados)
             return
         except APIError as e:
-            # erros comuns de cota/transiente
             print(f"⚠️  Destino {planilha_id} – APIError: {e}")
         except Exception as e:
             print(f"⚠️  Destino {planilha_id} – erro: {e}")
-
-        atraso = min(60, ATRASO_BASE * tentativa + 0.5 * tentativa * tentativa)
-        print(f"⏳ Tentativa {tentativa}/5 falhou; aguardando {atraso:.1f}s e tentando novamente…")
-        time.sleep(atraso)
-
-        if tentativa == 5:
-            print(f"⛔️ Não foi possível atualizar {planilha_id} após 5 tentativas. Abortando.")
-            sys.exit(1)
+    print(f"⛔️ Não foi possível atualizar {planilha_id} após 5 tentativas. Abortando.")
+    sys.exit(1)
 
 # === EXECUÇÃO ===
 if __name__ == '__main__':
@@ -191,4 +229,5 @@ if __name__ == '__main__':
     print(f"📦 Pronto para replicar: {len(dados)} linhas (A:S).")
     for pid in DESTINOS:
         tentar_destino_ate_dar_certo(pid, cab, dados)
+        time.sleep(0.6)  # pequena pausa entre destinos
     print("🏁 Réplica finalizada para todas as planilhas.")
