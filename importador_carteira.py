@@ -1,9 +1,9 @@
-# importador_carteira.py — Carteira limpa + CICLO/LV (CSV com retry + fallback Sheets) — FIX sem apóstrofo
+# importador_carteira.py — Carteira limpa + CICLO/LV (CSV com retry + fallback Sheets)
 # -*- coding: utf-8 -*-
 
 import os, re, json, time, random, unicodedata, pathlib, io
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Any, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -21,7 +21,7 @@ ORIGEM_ID   = '1lUNIeWCddfmvJEjWJpQMtuR4oRuMsI3VImDY0xBp3Bs'
 DESTINO_ID  = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA_ORIGEM  = 'Carteira'
 ABA_DESTINO = 'Carteira'
-CRED_JSON   = 'credenciais.json'  # pode ser env GOOGLE_CREDENTIALS (JSON) ou GOOGLE_APPLICATION_CREDENTIALS (caminho)
+CRED_JSON   = 'credenciais.json'  # ou GOOGLE_CREDENTIALS / GOOGLE_APPLICATION_CREDENTIALS
 
 COLS_ORIGEM  = ['A','Z','B','C','D','E','U','T','N','AA','AB','CN','CQ','CR','CS','BQ','CE','V']
 DATE_LETTERS = ['CN','CQ','CR','CS','BQ','CE']
@@ -35,10 +35,6 @@ FORCAR_DESTAQ    = False
 BATCH_ROWS_PER_RANGE  = 120
 RANGES_PER_BATCH_CALL = 25
 FETCH_ROWS_STEP       = 120
-
-# Colunas que o cliente quer SEM apóstrofo (números e datas), pela letra da aba de destino
-NUM_COLS_FIX  = ['J', 'K']         # moeda/número
-DATE_COLS_FIX = ['L', 'M', 'P', 'Q']  # datas dd/MM/yyyy
 
 MAP_UNIDADE = {
     'CONQUISTA': 'VITORIA DA CONQUISTA',
@@ -75,10 +71,12 @@ def with_retry(fn, *a, desc="", base=0.6, maxr=MAX_RETRIES, **k):
 # ───────── HELPERS ─────────
 def col_letter(n): return re.sub(r'\d','',rowcol_to_a1(1,n))
 def a1index(L):    return a1_to_rowcol(f"{L}1")[1]
+
 def ensure(ws,r,c):
+    # único lugar onde redimensionamos de propósito
     if ws.row_count<r or ws.col_count<c:
         log(f"🧩 resize → {r}x{c}")
-        with_retry(ws.resize,r,c,desc="resize")
+        with_retry(ws.resize, r, c, desc="resize")
 
 def norm_acento_up(s: str) -> str:
     if s is None: return ''
@@ -105,45 +103,6 @@ def parse_dates(series_like: pd.Series) -> pd.Series:
         s = s.where(~m, pd.to_datetime(n, unit='D', origin='1899-12-30', errors='coerce'))
     return s.dt.strftime('%d/%m/%Y').where(s.notna(), "")
 
-def parse_brl_to_float(x):
-    if x is None: return ""
-    s = str(x).strip()
-    if not s: return ""
-    # remove R$, espaços, NBSP:
-    s = s.replace("R$","").replace("\u00a0","").replace(" ","")
-    # resolve milhar/decimal
-    if "," in s and "." in s:
-        s = s.replace(".","").replace(",",".")
-    elif "," in s:
-        s = s.replace(",",".")
-    # mantém apenas [-+0-9.eE]
-    s = re.sub(r"[^0-9.\-+eE]","",s)
-    if s in ("", ".", "-", "+"): return ""
-    try:
-        return float(s)
-    except Exception:
-        return ""
-
-def parse_date_cell(x):
-    """Retorna dd/MM/yyyy (string) ou ''."""
-    if x is None: return ""
-    s = str(x).strip().replace("’","").replace("‘","").replace("'","")
-    s = re.sub(r"[^0-9/\-: ]","",s)
-    for fmt in ("%d/%m/%Y","%d/%m/%y","%Y-%m-%d","%d-%m-%Y"):
-        try:
-            return datetime.strptime(s.split(" ")[0], fmt).strftime("%d/%m/%Y")
-        except Exception:
-            continue
-    # também tenta serial Excel
-    try:
-        f = float(s.replace(",","."))
-        base = datetime(1899,12,30)
-        if f>0:
-            return (base + pd.to_timedelta(f, unit="D")).strftime("%d/%m/%Y")
-    except Exception:
-        pass
-    return s if s else ""
-
 def highlight(ws,start,count,end_col="Q"):
     if not FORCAR_DESTAQ or count<=0: return
     try:
@@ -166,22 +125,20 @@ def make_creds():
     if env_json:
         info = json.loads(env_json)
         return SACreds.from_service_account_info(info, scopes=SCOPES)
+
     env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if env_path and os.path.isfile(env_path):
         return SACreds.from_service_account_file(env_path, scopes=SCOPES)
+
     script_dir = pathlib.Path(__file__).resolve().parent
-    candidates = [script_dir / CRED_JSON, pathlib.Path.cwd() / CRED_JSON]
-    for p in candidates:
+    for p in (script_dir / CRED_JSON, pathlib.Path.cwd() / CRED_JSON):
         if p.is_file():
             return SACreds.from_service_account_file(p, scopes=SCOPES)
-    hint = (
-        "Não encontrei credenciais.\n"
-        "Use:\n"
-        "  a) set GOOGLE_CREDENTIALS com o JSON completo\n"
-        "  b) set GOOGLE_APPLICATION_CREDENTIALS com o caminho do .json\n"
-        f"  c) coloque '{CRED_JSON}' ao lado do script ({script_dir}) ou no diretório atual ({pathlib.Path.cwd()})\n"
+
+    raise FileNotFoundError(
+        "Credenciais não encontradas. Defina GOOGLE_CREDENTIALS (JSON) "
+        "ou GOOGLE_APPLICATION_CREDENTIALS (caminho) ou coloque 'credenciais.json'."
     )
-    raise FileNotFoundError(hint)
 
 def abrir_planilhas():
     log("🔐 Autenticando…")
@@ -281,7 +238,6 @@ def capturar_ciclo(creds: SACreds, b_dst) -> List[tuple]:
         ws = b_dst.worksheet("CICLO")
     except Exception:
         log("ℹ️  Aba 'CICLO' não encontrada — pulando."); return []
-    # CSV
     try:
         df = export_sheet_to_df_csv(creds, DESTINO_ID, ws.id)
         if df.empty: return []
@@ -303,8 +259,6 @@ def capturar_ciclo(creds: SACreds, b_dst) -> List[tuple]:
         return out
     except Exception as e:
         log(f"⚠️  CSV CICLO falhou — fallback Sheets: {e}")
-
-    # Fallback Sheets
     try:
         ids, rows_abs = ler_coluna_ids_batch_tolerante(ws, 'E', start_row=2)
         linhas_ids = [(r, (v or "").strip()) for v, r in zip(ids, rows_abs) if (v or "").strip()]
@@ -333,7 +287,6 @@ def capturar_lv(creds: SACreds, b_dst) -> List[tuple]:
         ws = b_dst.worksheet("LV CICLO")
     except Exception:
         log("ℹ️  Aba 'LV CICLO' não encontrada — pulando."); return []
-    # CSV
     try:
         df = export_sheet_to_df_csv(creds, DESTINO_ID, ws.id)
         if df.empty: return []
@@ -353,8 +306,6 @@ def capturar_lv(creds: SACreds, b_dst) -> List[tuple]:
         return out
     except Exception as e:
         log(f"⚠️  CSV LV falhou — fallback Sheets: {e}")
-
-    # Fallback Sheets
     try:
         ids, rows_abs = ler_coluna_ids_batch_tolerante(ws, 'B', start_row=2)
         linhas_ids = [(r, (v or "").strip()) for v, r in zip(ids, rows_abs) if (v or "").strip()]
@@ -390,19 +341,27 @@ def ler_origem_para_df(w_src) -> pd.DataFrame:
     for l in DATE_LETTERS:
         p = pos.get(l)
         if p is not None and p < len(df.columns): df.iloc[:,p] = parse_dates(df.iloc[:,p])
-    # (mantemos os demais textos como vieram; faremos fix-up por letra na planilha destino)
+    if "AC" in df.columns:
+        df["AC"] = pd.to_numeric(df["AC"].astype(str)
+                                 .str.replace("R$","",regex=False)
+                                 .str.replace(".","",regex=False)
+                                 .str.replace(",",".",regex=False), errors='coerce')
     return df
 
-# ───────── WRITE Carteira ─────────
+# ───────── WRITE Carteira (sem resize aqui) ─────────
 def escrever_df_na_destino(w_dst, df: pd.DataFrame) -> int:
     rows0 = len(df); cols0 = len(df.columns)
-    ensure(w_dst, rows0 + 2, max(20, cols0))
     endL  = col_letter(max(1, cols0))
+    # limpa corpo
     with_retry(w_dst.batch_clear, [f"A2:{endL}"], desc="clear dados")
+    # header
     if cols0 > 0:
-        with_retry(w_dst.update, range_name=f"A1:{rowcol_to_a1(1, cols0)}", values=[list(df.columns)], value_input_option='RAW')
+        with_retry(w_dst.update, range_name=f"A1:{rowcol_to_a1(1, cols0)}",
+                   values=[list(df.columns)], value_input_option='RAW')
     # status
-    with_retry(w_dst.update, range_name="T2", values=[[f"Atualizando... {now()}"]], value_input_option='RAW')
+    with_retry(w_dst.update, range_name="T2",
+               values=[[f"Atualizando... {now()}"]], value_input_option='RAW')
+    # escrita principal
     if rows0 > 0 and cols0 > 0:
         vals = df2values(df)
         log(f"🚚 Escrevendo {rows0} linhas em blocos de {CHUNK_ROWS_WRITE} (USER_ENTERED)…")
@@ -410,89 +369,46 @@ def escrever_df_na_destino(w_dst, df: pd.DataFrame) -> int:
         while i<rows0:
             part=vals[i:i+CHUNK_ROWS_WRITE]
             a1=f"A{2+i}:{endL}{1+i+len(part)}"
-            # USER_ENTERED para permitir o Sheets interpretar números/datas quando possível
             with_retry(w_dst.update, range_name=a1, values=part, value_input_option='USER_ENTERED')
             i+=len(part)
     log("✅ Escrita de Carteira concluída.")
     return 2 + rows0
 
-# ───────── INSERIR linhas (CICLO/LV) ─────────
+# ───────── INSERIR linhas (sem resize aqui) ─────────
 def inserir_linhas(w_dst, rows: List[List[Any]], start_row: int) -> int:
-    if not rows: return start_row
+    if not rows:
+        return start_row
+    # última coluna efetivamente usada
     last_col_idx = 1
     for r in rows:
         for j,v in enumerate(r, start=1):
-            if v not in ("", None, []): last_col_idx = max(last_col_idx, j)
+            if v not in ("", None, []):
+                last_col_idx = max(last_col_idx, j)
     endL = col_letter(last_col_idx)
-    a1 = f"A{start_row}:{endL}{start_row+len(rows)-1}"
-    # USER_ENTERED para evitar apóstrofo também nas inserções
-    with_retry(w_dst.update, range_name=a1, values=rows, value_input_option='USER_ENTERED')
-    if FORCAR_DESTAQ: highlight(w_dst, start_row, len(rows), endL)
+    a1   = f"A{start_row}:{endL}{start_row+len(rows)-1}"
+    with_retry(w_dst.update, range_name=a1, values=rows, value_input_option='RAW')
+    if FORCAR_DESTAQ:
+        highlight(w_dst, start_row, len(rows), endL)
     return start_row + len(rows)
-
-# ───────── FIX-UP pós-escrita (remove ' em J,K,L,M,P,Q) ─────────
-def fixup_num_and_dates(w_dst, total_rows_est: int):
-    if total_rows_est <= 0:
-        return
-    # Garante a grade pelo menos até a última linha estimada
-    ensure(w_dst, total_rows_est + 2, max(a1index('Q'), w_dst.col_count or 20))
-
-    def get_col(col_letter):
-        rng = f"{col_letter}2:{col_letter}{total_rows_est+1}"
-        vals = with_retry(w_dst.get, rng, desc=f"get {rng}") or []
-        # achata
-        flat = [ (row[0] if row and len(row)>0 else "") for row in vals ]
-        # se vier curto, completa
-        if len(flat) < (total_rows_est):
-            flat += [""]*((total_rows_est) - len(flat))
-        return flat
-
-    def put_col(col_letter, data):
-        # regrava em blocos com USER_ENTERED
-        step = 2000
-        for i in range(0, len(data), step):
-            parte = [[v] for v in data[i:i+step]]
-            a1 = f"{col_letter}{2+i}:{col_letter}{1+i+len(parte)}"
-            with_retry(w_dst.update, range_name=a1, values=parte, value_input_option='USER_ENTERED')
-
-    # NUMÉRICOS
-    for c in NUM_COLS_FIX:
-        raw = get_col(c)
-        conv = [parse_brl_to_float(x) for x in raw]
-        put_col(c, conv)
-
-    # DATAS
-    for c in DATE_COLS_FIX:
-        raw = get_col(c)
-        conv = [parse_date_cell(x) for x in raw]
-        put_col(c, conv)
-
-    log("🧼 Fix-up concluído (J,K numéricos; L,M,P,Q datas).")
 
 # ───────── MAIN ─────────
 def main():
     log("▶️  importador_carteira.py — iniciando")
     creds, gc, b_src, b_dst, w_src, w_dst = abrir_planilhas()
 
-    # 0) CAPTURAR CICLO / LV (CSV com retry; fallback Sheets tolerante)
+    # 0) CAPTURAR CICLO / LV
     dados_ciclo = capturar_ciclo(creds, b_dst)   # ("CICLO", vid, F, C, L, uni)
     dados_lv    = capturar_lv(creds, b_dst)      # ("LV", vid, proj, uni)
 
     # 1) ORIGEM → DF
     df = ler_origem_para_df(w_src)
 
-    # 2) Limpa e reescreve Carteira
-    next_row = escrever_df_na_destino(w_dst, df)
-
-    # 3) IDs da ORIGEM
-    exist_ids = set()
-    if not df.empty:
-        exist_ids = set(x for x in df.iloc[:,0].astype(str).str.strip().tolist() if x)
-
-    # 4) Monta linhas de CICLO/LV (sem novas leituras)
+    # 2) IDs já existentes
+    exist_ids = set(df.iloc[:,0].astype(str).str.strip().tolist()) if not df.empty else set()
     larg_min = max(len(df.columns) if not df.empty else 0, a1index('R'))
-    linhas: List[List[Any]] = []
 
+    # 3) Monta LINHAS (CICLO/LV) ANTES de escrever — para pré-resize único
+    linhas: List[List[Any]] = []
     # CICLO: E→A, F→B, C→H, L→K, D→R
     for _, vid, valF, valC, valL, uni in dados_ciclo:
         if not vid or vid in exist_ids: continue
@@ -500,12 +416,10 @@ def main():
         ln[a1index('A')-1] = vid
         ln[a1index('B')-1] = valF
         ln[a1index('H')-1] = valC
-        # K (moeda): já mando “limpo” para Sheets interpretar
-        ln[a1index('K')-1] = parse_brl_to_float(valL)
+        ln[a1index('K')-1] = valL
         ln[a1index('R')-1] = uni
         linhas.append(ln)
         exist_ids.add(vid)
-
     # LV: B→A, C→B, 'SOMENTE LV'→H, Unidade→R
     for _, vid, proj, uni in dados_lv:
         if not vid or vid in exist_ids: continue
@@ -517,7 +431,15 @@ def main():
         linhas.append(ln)
         exist_ids.add(vid)
 
-    # 5) Inserir tudo (USER_ENTERED)
+    # 4) PRÉ-RESIZE ÚNICO (antes de qualquer escrita)
+    linhas_previstas = (len(df) if not df.empty else 0) + len(linhas) + 4  # folga
+    colunas_previstas = max( max(20, len(df.columns) if not df.empty else 20), a1index('R') )
+    ensure(w_dst, linhas_previstas + 2, colunas_previstas)  # +2 por cabeçalho/1ª linha
+
+    # 5) Escreve Carteira (sem resize aqui)
+    next_row = escrever_df_na_destino(w_dst, df)
+
+    # 6) Insere CICLO/LV (sem resize aqui)
     if linhas:
         log(f"🔗 Inserindo {len(linhas)} linhas de CICLO/LV…")
         next_row = inserir_linhas(w_dst, linhas, next_row)
@@ -525,15 +447,10 @@ def main():
     else:
         log("ℹ️  Sem linhas adicionais de CICLO/LV para inserir.")
 
-    # 6) FIX-UP das colunas problemáticas (remove ' e deixa contável)
-    total_estimado = max(next_row - 2, 0)
-    if total_estimado > 0:
-        fixup_num_and_dates(w_dst, total_estimado)
-
     # 7) Status final
     with_retry(w_dst.update, range_name="T2",
                values=[[f"Concluído em {now()}"]], value_input_option='RAW')
-
+    total_estimado = next_row - 2
     log(f"🎉 Fim — linhas totais (estimado) na Carteira após inserções: ~{total_estimado}.")
 
 if __name__ == "__main__":
