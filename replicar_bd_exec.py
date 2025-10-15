@@ -1,16 +1,19 @@
-# replicar_bd_exec.py — A(origem)→A(dest), B(origem)→B(dest); apaga A2:B; limpa rabo; retries; sem pular destino
+# replicar_bd_exec.py — A(origem)->A(dest), B(origem)->B(dest); limpa A2:B; limpa rabo; retries; sem pular destino
 from datetime import datetime
 import os
 import re
 import time
 import sys
+import json
 import random
+import pathlib
+from typing import Optional, List
+
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # ========= CONFIG =========
-CAMINHO_CRED = 'credenciais.json'
 ID_ORIGEM    = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA          = 'BD_EXEC'
 
@@ -21,39 +24,50 @@ DESTINOS = [
     "1B-d3mYf7WwiAnkUTV0419f91OzPF8rcpimgtFNfQ3Mw",
 ]
 
-# Destino
 START_COL = 'A'
 END_COL   = 'B'
 START_ROW = 2
 CARIMBAR_CEL = 'E1'   # exige >= 5 colunas
 
-# Opções
 APAGAR_ANTES_A_B        = True   # apagão em A2:B antes de colar
 APLICAR_FORMATO_DATA_B  = False  # se True, força B como DATE dd/mm/yyyy
 CARIMBAR                = True
 
 # ========= TUNING (retries/backoff/pausas) =========
-# Códigos que vamos repetir
 TRANSIENT_CODES = {429, 500, 502, 503, 504}
-
-# Tentativas máximas por operação
 MAX_RETRIES = 6
 BASE_SLEEP  = 1.0  # s — exponencial + jitter
-
-# Pausas curtas para aliviar quota (write requests/min)
 PAUSE_BETWEEN_WRITES = 0.12  # s
 PAUSE_BETWEEN_DESTS  = 0.6   # s
 
-# Backoff especial por destino
 DESTINO_MAX_TENTATIVAS = 5
 DESTINO_BACKOFF_BASE_S = 5  # 5,10,20,40,80
 
-
-# ========= AUTH =========
+# ========= CREDENCIAIS =========
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-creds = Credentials.from_service_account_file(CAMINHO_CRED, scopes=SCOPES)
-gc = gspread.authorize(creds)
+CREDENTIALS_PATH_FALLBACK = "credenciais.json"
 
+def make_creds():
+    env_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if env_json:
+        try:
+            return SACreds.from_service_account_info(json.loads(env_json), scopes=SCOPES)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
+
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
+
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / CREDENTIALS_PATH_FALLBACK, pathlib.Path.cwd() / CREDENTIALS_PATH_FALLBACK):
+        if p.is_file():
+            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
+
+    raise FileNotFoundError("Credenciais não encontradas (GOOGLE_CREDENTIALS, GOOGLE_APPLICATION_CREDENTIALS ou credenciais.json).")
+
+creds = make_creds()
+gc = gspread.authorize(creds)
 
 # ========= UTILS =========
 def _status_code(e: APIError):
@@ -103,7 +117,6 @@ def _safe_update(ws, a1, values, value_input_option="USER_ENTERED", desc="update
     _with_retry(ws.update, range_name=a1, values=values, value_input_option=value_input_option, desc=desc)
     time.sleep(PAUSE_BETWEEN_WRITES)
 
-
 # ========= TRATAMENTO =========
 def limpar_num(txt):
     if txt is None:
@@ -149,13 +162,13 @@ def tratar_par_ab(a_raw, b_raw):
         b_val = limpar_num(b_raw)
     return [a_val if a_val is not None else "", b_val if b_val is not None else ""]
 
+# ========= LER FONTE via Values API =========
+print(f"📥 Lendo {ID_ORIGEM}/{ABA} (A2:B) via Values API…")
+book_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem")
+resp = _with_retry(book_src.values_get, f"{ABA}!A2:B", desc="values_get A2:B")
+vals = resp.get("values", []) if isinstance(resp, dict) else (resp or [])
 
-# ========= LER FONTE =========
-print(f"📥 Lendo {ID_ORIGEM}/{ABA} (A2:B)…")
-ws_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem").worksheet(ABA)
-vals = _with_retry(ws_src.get, 'A2:B', desc='get A2:B') or []
-
-linhas = []
+linhas: List[List[str]] = []
 for r in vals:
     a = r[0] if len(r) > 0 else ""
     b = r[1] if len(r) > 1 else ""
@@ -170,7 +183,6 @@ if nlin == 0:
     print("⚠️ Nada a replicar (A2:B está vazio).")
     sys.exit(0)
 
-
 # ========= ESCRITA =========
 def escrever_tudo(ws):
     first_row = START_ROW
@@ -180,16 +192,19 @@ def escrever_tudo(ws):
     # Garante grade p/ dados (A..B) e também p/ carimbar E1
     _ensure_grid(ws, min_rows=max(last_row, 2), min_cols_letter='E')
 
-    # 🔒 apagão antes (A2:B) — preserva cabeçalhos A1/B1
+    # 🔒 apagão antes (A2:B) — faixa explícita (evita “infinito”)
     if APAGAR_ANTES_A_B:
-        _values_clear(ws, f"'{ws.title}'!A2:B", desc='values_clear A2:B')
+        end_clear = max(ws.row_count, last_row + 200)  # limpa um pouco além do necessário
+        _values_clear(ws, f"'{ws.title}'!A2:B{end_clear}", desc='values_clear A2:B{end}')
 
     # escrita única
     _safe_update(ws, rng, linhas, value_input_option="USER_ENTERED", desc=f"update {rng}")
 
-    # limpa rabo (A{last_row+1}:B)
-    tail_rng = f"'{ws.title}'!A{last_row+1}:B"
-    _values_clear(ws, tail_rng, desc='values_clear rabo A:B')
+    # limpa rabo (A{last_row+1}:B{end_clear})
+    end_tail = max(ws.row_count, last_row + 200)
+    if end_tail >= last_row + 1:
+        tail_rng = f"'{ws.title}'!A{last_row+1}:B{end_tail}"
+        _values_clear(ws, tail_rng, desc='values_clear rabo A:B')
 
 def formatar(ws):
     if not APLICAR_FORMATO_DATA_B or nlin == 0:
@@ -233,7 +248,7 @@ def replicar_para(dest_id: str):
         ws = _with_retry(book.worksheet, ABA, desc=f"worksheet {ABA} destino")
     except WorksheetNotFound:
         ws = _with_retry(book.add_worksheet, title=ABA,
-                         rows=max(START_ROW + nlin + 100, 1000), cols=10,
+                         rows=max(START_ROW + nlin + 200, 1000), cols=10,
                          desc=f"add_worksheet {ABA} destino")
 
     # status
