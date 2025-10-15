@@ -42,7 +42,7 @@ from typing import Dict, List, Tuple, Optional
 
 import gspread
 from gspread.exceptions import APIError
-from google.oauth2.service_account import Credentials as SACreds as SACreds
+from google.oauth2.service_account import Credentials as SACreds
 
 # =======================
 # CONFIGURAÇÕES GERAIS
