@@ -1,6 +1,7 @@
 # === GitHub Actions-friendly Google credentials helper ===
 import os, json, pathlib
 from google.oauth2.service_account import Credentials as SACreds
+Credentials = SACreds  # retrocompatibilidade (se o código antigo referir 'Credentials')
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
@@ -115,8 +116,7 @@ log("🚀 Iniciando MED PARCIAL")
 # ---- Autenticação
 log("🔐 Autenticando no Google…")
 escopos = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-credenciais = Credentials.from_service_account_file(CAMINHO_CREDENCIAIS, scopes=escopos)
-creds = make_creds()
+credenciais = make_creds()
 gc = gspread.authorize(credenciais)
 
 # ---- Abertura
