@@ -1,21 +1,19 @@
 # replicar_cart_plan.py — replica BD_EXEC!F:J (UNIDADE, FIM PREVISTO, STATUS EXECUCAO, PROJETO, AL)
-# - Leitura:  ID_ORIGEM/ABA  :: F2:J
-# - Destinos: DESTINOS        :: escreve F2:J (limpa antes + limpa rabo)
+# - Lê:   ID_ORIGEM/ABA :: F2:J  (Values API)
+# - Dest: DESTINOS       :: escreve F2:J (limpa antes + limpa rabo)
 # - Resiliente: retries 429/500/502/503/504, backoff exponencial + jitter
-# - Garante grade para E1 (status) e até J (col 10)
-# - Pausas leves para aliviar write/min
+# - Garante grade até J e E1 (status)
+# - Pausas leves para respeitar write/min
 
 from datetime import datetime
-import re
-import time
-import sys
-import random
+import os, re, time, sys, json, random, pathlib
+from typing import List, Optional
+
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # ========= CONFIG =========
-CAMINHO_CRED   = 'credenciais.json'
 ID_ORIGEM      = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA            = 'BD_EXEC'
 
@@ -26,35 +24,51 @@ DESTINOS = [
     "1B-d3mYf7WwiAnkUTV0419f91OzPF8rcpimgtFNfQ3Mw",
 ]
 
-# Faixas
-SRC_RANGE      = 'F2:J'  # 5 colunas
+SRC_RANGE      = 'F2:J'   # 5 colunas
 DST_START_COL  = 'F'
 DST_END_COL    = 'J'
 DST_START_ROW  = 2
-CARIMBAR_CEL   = 'E1'    # status/timestamp
+CARIMBAR_CEL   = 'E1'
 
-# Opções
-APAGAR_ANTES_FJ        = True   # apagão em F2:J antes de escrever
-APLICAR_FORMATO_DATA_G = False  # se True, força G como DATE dd/mm/yyyy
+APAGAR_ANTES_FJ        = True
+APLICAR_FORMATO_DATA_G = False  # se True, força G como DATE dd/MM/yyyy
 CARIMBAR               = True
 
-# ========= TUNING (retries/backoff/pausas) =========
+# ========= TUNING =========
 TRANSIENT_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES     = 6
-BASE_SLEEP      = 1.0  # s — exponencial + jitter
-PAUSE_BETWEEN_WRITES = 0.12  # s
-PAUSE_BETWEEN_DESTS  = 0.6   # s
+BASE_SLEEP      = 1.0
+PAUSE_BETWEEN_WRITES = 0.12
+PAUSE_BETWEEN_DESTS  = 0.6
 
 DESTINO_MAX_TENTATIVAS = 5
 DESTINO_BACKOFF_BASE_S = 5  # 5,10,20,40,80
 
-# ========= AUTH =========
+# ========= CREDENCIAIS FLEXÍVEIS =========
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-creds = Credentials.from_service_account_file(CAMINHO_CRED, scopes=SCOPES)
+CREDENTIALS_PATH_FALLBACK = "credenciais.json"
+
+def make_creds():
+    env_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if env_json:
+        try:
+            return SACreds.from_service_account_info(json.loads(env_json), scopes=SCOPES)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / CREDENTIALS_PATH_FALLBACK, pathlib.Path.cwd() / CREDENTIALS_PATH_FALLBACK):
+        if p.is_file():
+            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
+    raise FileNotFoundError("Credenciais não encontradas (GOOGLE_CREDENTIALS, GOOGLE_APPLICATION_CREDENTIALS ou credenciais.json).")
+
+creds = make_creds()
 gc = gspread.authorize(creds)
 
-# ========= UTILS =========
-def _status_code(e: APIError):
+# ========= RETRY / UTILS =========
+def _status_code(e: APIError) -> Optional[int]:
     m = re.search(r"\[(\d+)\]", str(e))
     try:
         return int(m.group(1)) if m else None
@@ -89,6 +103,10 @@ def _ensure_grid(ws, min_rows: int, min_cols_letter: str):
         new_cols = max(cur_cols, min_cols)
         print(f"🧩 resize → {ws.title}: {cur_rows}x{cur_cols} -> {new_rows}x{new_cols}")
         _with_retry(ws.resize, rows=new_rows, cols=new_cols, desc=f"resize {ws.title}")
+
+def _values_get(book, a1):
+    resp = _with_retry(book.values_get, a1, desc=f"values_get {a1}")
+    return resp.get("values", []) if isinstance(resp, dict) else (resp or [])
 
 def _values_clear(ws, a1, desc="values_clear"):
     _with_retry(ws.spreadsheet.values_clear, a1, desc=desc)
@@ -138,7 +156,7 @@ def tratar_row_fghij(r5):
     """
     Entrada: lista de 5 valores (F,G,H,I,J).
     - Remove apóstrofo inicial em F,H,I,J.
-    - G: tenta data (dd/mm/aaaa); se não der, tenta número limpo.
+    - G: tenta data (dd/mm/aaaa); senão número limpo.
     """
     r = (r5 + [""] * 5)[:5]
     for idx in (0, 2, 3, 4):  # F,H,I,J
@@ -149,12 +167,12 @@ def tratar_row_fghij(r5):
     r[1] = g_fmt if g_fmt and re.match(r'^\d{2}/\d{2}/\d{4}$', g_fmt) else limpar_num(g_raw)
     return r
 
-# ========= LER FONTE =========
-print(f"📥 Lendo {ID_ORIGEM}/{ABA} ({SRC_RANGE})…")
-ws_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem").worksheet(ABA)
-vals = _with_retry(ws_src.get, SRC_RANGE, desc='get F2:J') or []
+# ========= LER FONTE (Values API) =========
+print(f"📥 Lendo {ID_ORIGEM}/{ABA} ({SRC_RANGE}) via Values API…")
+book_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem")
+vals = _values_get(book_src, f"{ABA}!{SRC_RANGE}")  # lista de linhas
 
-linhas = []
+linhas: List[List[str]] = []
 for r in vals:
     r5 = (r + [""] * 5)[:5]
     if not any((str(c or "").strip() for c in r5)):
@@ -178,16 +196,20 @@ def escrever_tudo(ws):
     _ensure_grid(ws, min_rows=max(last_row, 2), min_cols_letter='J')
     _ensure_grid(ws, min_rows=2, min_cols_letter='E')
 
-    # apagão antes (F2:J)
+    # apagão antes F:J com faixa explícita (evita “infinito”)
     if APAGAR_ANTES_FJ:
-        _values_clear(ws, f"'{ws.title}'!{DST_START_COL}{DST_START_ROW}:{DST_END_COL}", desc='values_clear F2:J')
+        end_clear = max(ws.row_count, last_row + 200)
+        _values_clear(ws, f"'{ws.title}'!{DST_START_COL}{DST_START_ROW}:{DST_END_COL}{end_clear}",
+                      desc='values_clear F2:J{end}')
 
     # escrita única
     _safe_update(ws, rng, linhas, value_input_option="USER_ENTERED", desc=f"update {rng}")
 
-    # limpa rabo (linhas abaixo)
-    tail_rng = f"'{ws.title}'!{DST_START_COL}{last_row+1}:{DST_END_COL}"
-    _values_clear(ws, tail_rng, desc='values_clear rabo F:J')
+    # limpa rabo (linhas abaixo do último)
+    end_tail = max(ws.row_count, last_row + 200)
+    if end_tail >= last_row + 1:
+        tail_rng = f"'{ws.title}'!{DST_START_COL}{last_row+1}:{DST_END_COL}{end_tail}"
+        _values_clear(ws, tail_rng, desc='values_clear rabo F:J')
 
 def formatar(ws):
     if not APLICAR_FORMATO_DATA_G or nlin == 0:
@@ -229,7 +251,7 @@ def replicar_para(dest_id: str):
         ws = _with_retry(book.worksheet, ABA, desc=f"worksheet {ABA} destino")
     except WorksheetNotFound:
         ws = _with_retry(book.add_worksheet, title=ABA,
-                         rows=max(DST_START_ROW + nlin + 100, 1000), cols=20,
+                         rows=max(DST_START_ROW + nlin + 200, 1000), cols=20,
                          desc=f"add_worksheet {ABA} destino")
 
     # status inicial
