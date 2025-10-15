@@ -1,10 +1,37 @@
+# === GitHub Actions-friendly Google credentials helper ===
+import os, json, pathlib
+from google.oauth2.service_account import Credentials as SACreds
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive"]
+
+def make_creds():
+    env_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if env_json:
+        try:
+            return SACreds.from_service_account_info(json.loads(env_json), scopes=SCOPES)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / "credenciais.json", pathlib.Path.cwd() / "credenciais.json"):
+        if p.is_file():
+            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
+    raise FileNotFoundError(
+        "Credenciais não encontradas. Defina GOOGLE_CREDENTIALS com o JSON "
+        "ou GOOGLE_APPLICATION_CREDENTIALS com o caminho do .json, "
+        "ou mantenha 'credenciais.json' local."
+    )
+# === end helper ===
 import os
 import re
 import time
 import random
 import gspread
 from datetime import datetime
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError
 
 # ================== FLAGS / TUNING ==================
@@ -110,6 +137,7 @@ log("🟢 INÍCIO: copiar A,B (Código/Valor) → BD_EXEC!A,B + status em E2")
 log("🔐 Autenticando…")
 escopos = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 cred = Credentials.from_service_account_file(CAMINHO_CREDENCIAIS, scopes=escopos)
+creds = make_creds()
 gc = gspread.authorize(cred)
 
 # ---- Abrir origem/destino
