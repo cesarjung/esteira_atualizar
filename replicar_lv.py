@@ -1,10 +1,15 @@
-# replicar_lv.py — resiliente, rápido e com números contáveis; formatações opcionais; sem pular destino
+# replicar_lv.py — resiliente, rápido e com números contáveis; sem pular destino
+
 from datetime import datetime
+import os, json, pathlib
 import re
 import time
 import sys
+import random
+from typing import List
+
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 from gspread.utils import rowcol_to_a1
 
@@ -20,7 +25,6 @@ DESTINOS = [
     '1B-d3mYf7WwiAnkUTV0419f91OzPF8rcpimgtFNfQ3Mw',
 ]
 ABA_DESTINO  = 'LV CICLO'
-CAM_CRED     = 'credenciais.json'
 
 # Colunas (0-based) — do seu original:
 NUM_COLS = [5, 10, 19, 21, 22]  # F, K, T, V, W
@@ -30,51 +34,55 @@ DATE_COL = 7                    # H
 N_COLS = 25  # A..Y
 LAST_COL_LETTER = re.sub(r'\d+', '', rowcol_to_a1(1, N_COLS))  # 'Y'
 
-# Opções (desligadas por padrão p/ performance)
+# Opções (desligadas por padrão p/ quota/velocidade)
 APLICAR_FORMATO_NUMEROS = False
 APLICAR_FORMATO_DATAS   = False
-CARIMBAR                 = True
-CARIMBAR_CEL             = 'Z1'     # se não existir, usa última coluna existente da linha 1
-HARD_CLEAR_BEFORE_WRITE  = False    # limpar A:Y antes de escrever (1 chamada extra)
+CARIMBAR                = True
+CARIMBAR_CEL            = 'Z1'     # se não existir, usa última coluna existente da linha 1
+HARD_CLEAR_BEFORE_WRITE = False    # limpar A:Y antes de escrever (1 chamada extra)
 
-# Retries de chamadas individuais
-RETRY_CRIT = (1, 3, 7, 15)
-RETRY_SOFT = (1,)
+# Retries / tuning
+TRANSIENT_CODES         = {429, 500, 502, 503, 504}
+MAX_RETRIES             = 6
+BASE_SLEEP              = 1.0
+PAUSE_BETWEEN_DESTS     = 0.6
+PAUSE_BETWEEN_WRITES    = 0.10
+EXTRA_TAIL_ROWS         = 200      # limpeza extra do rabo
+DESTINO_MAX_TENTATIVAS  = 5
+DESTINO_BACKOFF_BASE_S  = 5        # 5,10,20,40,80s
 
-# Tentativas externas por DESTINO (não pular nunca)
-DESTINO_MAX_TENTATIVAS = 5
-DESTINO_BACKOFF_BASE_S = 5  # 5,10,20,40,80s
-
-# ========= AUTH =========
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-creds = Credentials.from_service_account_file(CAM_CRED, scopes=SCOPES)
-gc = gspread.authorize(creds)
 
-# ========= UTILS =========
-def _is_transient(e: Exception) -> bool:
-    s = str(e)
-    return any(t in s for t in ('[500]', '[503]', 'backendError', 'rateLimitExceeded',
-                                'Internal error', 'service is currently unavailable'))
+# ========= CREDENCIAIS FLEXÍVEIS =========
+def make_creds():
+    env = os.environ.get('GOOGLE_CREDENTIALS')
+    if env:
+        return SACreds.from_service_account_info(json.loads(env), scopes=SCOPES)
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
+    return SACreds.from_service_account_file(pathlib.Path('credenciais.json'), scopes=SCOPES)
 
-def _retry(delays, fn, *args, swallow_final=False, op_name=None, **kwargs):
-    total = len(delays)
-    for i, d in enumerate(delays, start=1):
+# ========= RETRY/UTILS =========
+def _status_code(e: APIError):
+    m = re.search(r"\[(\d{3})\]", str(e))
+    try:
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+def _with_retry(fn, *args, desc=None, **kwargs):
+    for tent in range(1, MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
         except APIError as e:
-            if not _is_transient(e):
-                if swallow_final:
-                    print(f"⚠️ Operação ignorada ({op_name or 'op'}): {e}")
-                    return None
+            code = _status_code(e)
+            if code not in TRANSIENT_CODES or tent >= MAX_RETRIES:
+                print(f"❌ {desc or fn.__name__} falhou: {e}")
                 raise
-            tag = f" ({op_name})" if op_name else ""
-            print(f"⚠️ Falha transitória da API{tag}: {e} — tentativa {i}/{total}; aguardando {d}s")
-            if i == total:
-                if swallow_final:
-                    print(f"⚠️ API instável — operação ignorada após {total} tentativas{tag}.")
-                    return None
-                raise
-            time.sleep(d)
+            slp = min(60.0, BASE_SLEEP * (2 ** (tent - 1)) + random.uniform(0, 0.75))
+            print(f"⚠️  {desc or fn.__name__}: HTTP {code} — retry {tent}/{MAX_RETRIES-1} em {slp:.1f}s")
+            time.sleep(slp)
 
 def col_letter_to_index_1b(letter: str) -> int:
     idx = 0
@@ -89,11 +97,11 @@ def col_index_to_letter_1b(index: int) -> str:
         res = chr(rem + ord('A')) + res
     return res
 
-def a1_parse(cell: str):
-    m = re.match(r'^([A-Za-z]+)(\d+)$', cell.strip())
-    if not m:
-        return 'A', 1
-    return m.group(1).upper(), int(m.group(2))
+def a1(col_1b: int, row_1b: int) -> str:
+    return f"{col_index_to_letter_1b(col_1b)}{row_1b}"
+
+def agora() -> str:
+    return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
 
 # ========= TRATAMENTO =========
 def limpar_num(txt: str):
@@ -115,7 +123,7 @@ def limpar_num(txt: str):
     except Exception:
         return ""
 
-def tratar_linha(row, n_cols):
+def tratar_linha(row: List[str], n_cols: int):
     # garante n_cols e remove apóstrofo inicial
     r = [(c if c is not None else "") for c in row[:n_cols]] + [""] * max(0, n_cols - len(row))
     for i in range(n_cols):
@@ -141,141 +149,115 @@ def tratar_linha(row, n_cols):
                 r[DATE_COL] = dt.strftime("%d/%m/%Y")
     return r
 
-# ========= LER FONTE =========
-print(f"📥 Lendo {ID_FONTE}/{ABA_FONTE} ({RANGE_FONTE})…")
-ws_src = gc.open_by_key(ID_FONTE).worksheet(ABA_FONTE)
-vals = _retry(RETRY_CRIT, ws_src.get, RANGE_FONTE, op_name='get fonte') or []
-if not vals:
-    print("⚠️ Nada a replicar (faixa vazia).")
-    sys.exit(0)
-
-header = (vals[0] + [""] * N_COLS)[:N_COLS]
-rows_raw = vals[1:]
-rows = []
-for r in rows_raw:
-    if not any((c or "").strip() for c in r[:N_COLS]):  # ignora totalmente vazias
-        continue
-    rows.append(tratar_linha(r, N_COLS))
-
-all_vals = [header] + rows
-nlin = len(all_vals)
-print(f"✅ {len(rows)} linhas preparadas.\n")
-
-# ========= ESCRITA / FORMATAÇÃO =========
+# ========= GRADE/LIMPEZA/ESCRITA =========
 def ensure_grid(ws, min_rows: int, min_cols: int):
-    try:
-        cur_rows = ws.row_count
-        cur_cols = ws.col_count
-    except Exception:
-        cur_rows = cur_cols = 0
-    if cur_rows < min_rows or cur_cols < min_cols:
-        _retry(RETRY_CRIT, ws.resize, rows=max(cur_rows, min_rows), cols=max(cur_cols, min_cols), op_name='resize')
+    rows = max(ws.row_count, min_rows)
+    cols = max(ws.col_count, min_cols)
+    if rows != ws.row_count or cols != ws.col_count:
+        print(f"🧩 resize {ws.title}: {ws.row_count}x{ws.col_count} → {rows}x{cols}")
+        _with_retry(ws.resize, rows=rows, cols=cols, desc=f"resize {ws.title}")
 
-def escrever_tudo(ws):
-    rng = f"A1:{LAST_COL_LETTER}{nlin}"
+def limpar_corpo(ws, nlin: int):
+    # limpa A2:Y{end_clear}
+    end_clear = max(ws.row_count, nlin + EXTRA_TAIL_ROWS)
+    rng = f"'{ws.title}'!A2:{a1(col_letter_to_index_1b(LAST_COL_LETTER), end_clear)}"
+    _with_retry(ws.spreadsheet.values_clear, rng, desc=f"values_clear {rng}")
+    time.sleep(PAUSE_BETWEEN_WRITES)
+
+def limpar_rabo(ws, nlin: int):
+    # limpa abaixo do último registro (A{nlin+1}:Y{end_clear})
+    end_clear = max(ws.row_count, nlin + EXTRA_TAIL_ROWS)
+    if end_clear > (nlin + 1):
+        tail = f"'{ws.title}'!A{nlin+1}:{a1(col_letter_to_index_1b(LAST_COL_LETTER), end_clear)}"
+        _with_retry(ws.spreadsheet.values_clear, tail, desc=f"values_clear {tail}")
+        time.sleep(PAUSE_BETWEEN_WRITES)
+
+def escrever(ws, all_vals: List[List[str]]):
+    nlin = len(all_vals)
+    rng  = f"A1:{LAST_COL_LETTER}{nlin}"
     ensure_grid(ws, min_rows=nlin, min_cols=N_COLS)
-
-    if HARD_CLEAR_BEFORE_WRITE:
-        _retry(RETRY_CRIT, ws.spreadsheet.values_clear, f"'{ws.title}'!A:{LAST_COL_LETTER}", op_name='values_clear A:Y')
-
-    _retry(RETRY_CRIT, ws.update,
-           values=all_vals, range_name=rng,
-           value_input_option="USER_ENTERED", op_name='update A1:Y')
-
-    # limpa “rabo” (linhas abaixo do dataset)
-    try:
-        max_rows = ws.row_count
-    except Exception:
-        max_rows = nlin
-    if max_rows > nlin:
-        tail_rng = f"'{ws.title}'!A{nlin+1}:{LAST_COL_LETTER}"
-        _retry(RETRY_CRIT, ws.spreadsheet.values_clear, tail_rng, op_name='values_clear rabo')
-
-def formatar(ws):
-    # só aplica se ligado e houver linhas
-    if not (APLICAR_FORMATO_NUMEROS or APLICAR_FORMATO_DATAS) or len(rows) == 0:
-        return
-    end_row = len(rows) + 1  # exclusivo
-    reqs = []
-    sid = ws.id
-
-    if APLICAR_FORMATO_NUMEROS:
-        for idx in sorted(NUM_COLS):
-            if idx < N_COLS:
-                reqs.append({
-                    "repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": end_row,
-                                  "startColumnIndex": idx, "endColumnIndex": idx + 1},
-                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
-                        "fields": "userEnteredFormat.numberFormat"
-                    }
-                })
-    if APLICAR_FORMATO_DATAS and DATE_COL < N_COLS:
-        reqs.append({
-            "repeatCell": {
-                "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": end_row,
-                          "startColumnIndex": DATE_COL, "endColumnIndex": DATE_COL + 1},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}}},
-                "fields": "userEnteredFormat.numberFormat"
-            }
-        })
-    if reqs:
-        _retry(RETRY_SOFT, ws.spreadsheet.batch_update, {"requests": reqs},
-               swallow_final=True, op_name='batch_update format')
+    _with_retry(ws.update, range_name=rng, values=all_vals, value_input_option="USER_ENTERED", desc=f"update {rng}")
+    time.sleep(PAUSE_BETWEEN_WRITES)
 
 def carimbar(ws):
     if not CARIMBAR:
         return
-    # célula segura: se Z1 não existir, usa última coluna disponível na linha 1
-    desired_letter, desired_row = a1_parse(CARIMBAR_CEL)
+    # Z1 se possível; senão usa última coluna
+    desired_letter = re.match(r'^([A-Za-z]+)', CARIMBAR_CEL).group(1) if CARIMBAR_CEL else 'Z'
+    desired_row = int(re.search(r'\d+$', CARIMBAR_CEL).group(0)) if CARIMBAR_CEL and re.search(r'\d+$', CARIMBAR_CEL) else 1
     desired_col_1b = col_letter_to_index_1b(desired_letter)
-    try:
-        max_cols = ws.col_count
-        max_rows = ws.row_count
-    except Exception:
-        max_cols = N_COLS
-        max_rows = max(nlin, 1)
+    max_cols = getattr(ws, "col_count", N_COLS)
+    max_rows = getattr(ws, "row_count", 1)
     safe_col_1b = min(desired_col_1b, max_cols if max_cols else N_COLS)
     safe_row = min(max(desired_row, 1), max_rows if max_rows else 1)
-    safe_cell = f"{col_index_to_letter_1b(safe_col_1b)}{safe_row}"
-    ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    _retry(RETRY_SOFT, ws.update,
-           values=[[f'Atualizado em: {ts}']],
-           range_name=safe_cell,
-           value_input_option='RAW',
-           swallow_final=True,
-           op_name=f'carimbar {safe_cell}')
+    cell = a1(safe_col_1b, safe_row)
+    ts = agora()
+    _with_retry(ws.update, range_name=cell, values=[[f'Atualizado em: {ts}']], value_input_option='RAW', desc=f"carimbar {cell}")
 
-def replicar_para(dest_id: str):
-    print(f"➡️ Atualizando {dest_id}/{ABA_DESTINO} …")
-    book = gc.open_by_key(dest_id)
-    try:
-        ws = book.worksheet(ABA_DESTINO)
-    except WorksheetNotFound:
-        # cria com cols >= 26 para comportar a coluna Z do carimbo
-        ws = book.add_worksheet(title=ABA_DESTINO, rows=max(nlin, 1000), cols=max(26, N_COLS))
-    escrever_tudo(ws)   # crítico
-    formatar(ws)        # opcional
-    carimbar(ws)        # opcional (nunca derruba destino)
-    print(f"✅ Replicado {len(rows)} linhas para {dest_id}.")
+# ========= MAIN =========
+def main():
+    creds = make_creds()
+    gc = gspread.authorize(creds)
 
-def tentar_destino_ate_dar_certo(planilha_id: str):
-    for tentativa in range(1, DESTINO_MAX_TENTATIVAS + 1):
-        try:
-            if tentativa > 1:
-                atraso = DESTINO_BACKOFF_BASE_S * (2 ** (tentativa - 2))  # 5,10,20,40,80...
-                print(f"🔁 Tentativa {tentativa}/{DESTINO_MAX_TENTATIVAS} para {planilha_id} — aguardando {atraso}s")
+    # --- Ler fonte ---
+    print(f"📥 Lendo {ID_FONTE}/{ABA_FONTE} ({RANGE_FONTE})…")
+    sh_src = _with_retry(gc.open_by_key, ID_FONTE, desc="open_by_key fonte")
+    ws_src = _with_retry(sh_src.worksheet, ABA_FONTE, desc="worksheet fonte")
+    vals = _with_retry(ws_src.get, RANGE_FONTE, desc=f"get {RANGE_FONTE}") or []
+    if not vals:
+        print("⚠️ Nada a replicar (faixa vazia).")
+        sys.exit(0)
+
+    header = (vals[0] + [""] * N_COLS)[:N_COLS]
+    rows_raw = vals[1:]
+    rows = []
+    for r in rows_raw:
+        if not any((c or "").strip() for c in r[:N_COLS]):  # ignora totalmente vazias
+            continue
+        rows.append(tratar_linha(r, N_COLS))
+    all_vals = [header] + rows
+    nlin = len(all_vals)
+    print(f"✅ {len(rows)} linhas preparadas.\n")
+
+    # --- Replicar para cada destino ---
+    for i, pid in enumerate(DESTINOS, start=1):
+        print(f"➡️ [{i}/{len(DESTINOS)}] Atualizando {pid}/{ABA_DESTINO} …")
+        for tentativa in range(1, DESTINO_MAX_TENTATIVAS + 1):
+            try:
+                sh = _with_retry(gc.open_by_key, pid, desc=f"open_by_key destino {pid}")
+                try:
+                    ws = _with_retry(sh.worksheet, ABA_DESTINO, desc=f"worksheet {ABA_DESTINO} destino")
+                except WorksheetNotFound:
+                    ws = _with_retry(sh.add_worksheet, title=ABA_DESTINO,
+                                     rows=max(nlin, 1000),
+                                     cols=max(26, N_COLS),
+                                     desc=f"add_worksheet {ABA_DESTINO} destino")
+
+                ensure_grid(ws, min_rows=nlin + EXTRA_TAIL_ROWS, min_cols=max(26, N_COLS))
+
+                if HARD_CLEAR_BEFORE_WRITE:
+                    _with_retry(ws.spreadsheet.values_clear, f"'{ws.title}'!A:{LAST_COL_LETTER}", desc="values_clear A:Y")
+
+                limpar_corpo(ws, nlin)
+                escrever(ws, all_vals)
+                limpar_rabo(ws, nlin)
+                # formatação pesada desligada por padrão (ligue se necessário)
+                # carimbo
+                carimbar(ws)
+
+                print(f"✅ Replicado {len(rows)} linhas para {pid}.")
+                time.sleep(PAUSE_BETWEEN_DESTS)
+                break
+            except Exception as e:
+                print(f"❌ Tentativa {tentativa}/{DESTINO_MAX_TENTATIVAS} falhou para {pid}: {e}")
+                if tentativa == DESTINO_MAX_TENTATIVAS:
+                    print(f"⛔️ Não foi possível atualizar {pid} após {DESTINO_MAX_TENTATIVAS} tentativas. Abortando.")
+                    sys.exit(1)
+                atraso = DESTINO_BACKOFF_BASE_S * (2 ** (tentativa - 1))
+                print(f"⏳ Repetindo em {atraso}s…")
                 time.sleep(atraso)
-            replicar_para(planilha_id)
-            return  # sucesso
-        except Exception as e:
-            print(f"❌ Falha na tentativa {tentativa} para {planilha_id}: {e}")
-            if tentativa == DESTINO_MAX_TENTATIVAS:
-                print(f"⛔️ Não foi possível atualizar {planilha_id} após {DESTINO_MAX_TENTATIVAS} tentativas. Abortando.")
-                sys.exit(1)
 
-# ========= EXECUÇÃO =========
-print(f"📦 Pronto para replicar: {len(rows)} linhas (A:Y).")
-for pid in DESTINOS:
-    tentar_destino_ate_dar_certo(pid)
-print("🏁 Replicação de LV CICLO finalizada.")
+    print("🏁 Replicação de LV CICLO finalizada.")
+
+if __name__ == "__main__":
+    main()
