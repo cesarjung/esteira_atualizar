@@ -1,10 +1,15 @@
+# cart_plan.py — revisado (values_get, credenciais flexíveis, clears explícitos)
 import os
 import re
 import time
 import random
+import json
+import pathlib
 import gspread
 from datetime import datetime, timedelta
-from google.oauth2.service_account import Credentials
+from typing import Optional, List
+
+from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # ========= FLAGS =========
@@ -32,12 +37,35 @@ def with_retry(fn, *args, desc="", base_sleep=BASE_SLEEP, max_retries=MAX_RETRIE
         except APIError as e:
             tent += 1
             code = _status_code(e)
-            if tent >= max_retries or code not in TRANSIENT_CODES:
+            if tent >= max_retries or (code is not None and code not in TRANSIENT_CODES):
                 log(f"❌ Falhou: {desc or fn.__name__} | {e}")
                 raise
             slp = min(60, base_sleep * (2 ** (tent - 1)) + random.uniform(0, 0.75))
             log(f"⚠️  HTTP {code} — retry {tent}/{max_retries-1} em {slp:.1f}s ({desc or fn.__name__})")
             time.sleep(slp)
+
+# ========= CREDENCIAIS =========
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+CREDENTIALS_PATH_FALLBACK = "credenciais.json"
+
+def make_creds():
+    env_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if env_json:
+        try:
+            return SACreds.from_service_account_info(json.loads(env_json), scopes=SCOPES)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
+
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
+
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / CREDENTIALS_PATH_FALLBACK, pathlib.Path.cwd() / CREDENTIALS_PATH_FALLBACK):
+        if p.is_file():
+            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
+
+    raise FileNotFoundError("Credenciais não encontradas (GOOGLE_CREDENTIALS, GOOGLE_APPLICATION_CREDENTIALS ou credenciais.json).")
 
 # ========= HELPERS =========
 def ensure_size(ws, min_rows, min_cols):
@@ -109,8 +137,7 @@ def parse_data_br(txt):
 t0_ini = time.time()
 log("🟢 INÍCIO importação BD_EXEC (Carteira_Planejador → F/G/H/I/J/K)")
 log("🔐 Autenticando…")
-scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-creds  = Credentials.from_service_account_file('credenciais.json', scopes=scopes)
+creds  = make_creds()
 gc     = gspread.authorize(creds)
 
 PLANILHA_DESTINO_ID = "1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM"
@@ -152,23 +179,26 @@ safe_update(ws_dst, "J1",   header_J)
 safe_update(ws_dst, "K1",   header_K)
 
 # ========= COLETA DE DADOS =========
-todos_FI = []  # F..I (4 colunas)
-todas_J  = []  # J (AL da origem)
-todas_K  = []  # K (DATA BI)
+todos_FI: List[List[str]] = []  # F..I (4 colunas)
+todas_J:  List[List[str]] = []  # J (AL da origem)
+todas_K:  List[List[str]] = []  # K (DATA BI)
 total_linhas = 0
+
+def values_get(spreadsheet, a1_range: str):
+    # gspread Spreadsheet.values_get -> {'range':..., 'majorDimension':..., 'values': [...]}
+    resp = with_retry(spreadsheet.values_get, a1_range, desc=f"values_get {a1_range}")
+    return resp.get("values", []) or []
 
 for idx, origem_id in enumerate(ORIGENS, 1):
     try:
         log(f"📥 [{idx}/{len(ORIGENS)}] Lendo origem {origem_id} :: 'Carteira_Planejador'…")
         book_src = with_retry(gc.open_by_key, origem_id, desc=f"open_by_key origem {idx}")
-        ws_src   = with_retry(book_src.worksheet, "Carteira_Planejador", desc=f"worksheet origem {idx}")
-
-        # A6:BI (1..61) — lendo em lote
-        valores = with_retry(ws_src.get, "A6:BI", desc=f"get A6:BI origem {idx}")
-        log(f"   ↳ Linhas lidas: {len(valores)}")
+        # **Leitura via Values API** — mais estável que ws.get
+        dados = values_get(book_src, "Carteira_Planejador!A6:BI")
+        log(f"   ↳ Linhas lidas: {len(dados)}")
 
         # M(13)->12, O(15)->14, P(16)->15, Q(17)->16, AL(38)->37, BI(61)->60
-        for row in valores:
+        for row in dados:
             m  = row[12] if len(row) > 12 else ""   # UNIDADE
             o  = row[14] if len(row) > 14 else ""   # FIM PREVISTO
             p  = row[15] if len(row) > 15 else ""   # STATUS EXECUCAO
@@ -180,7 +210,7 @@ for idx, origem_id in enumerate(ORIGENS, 1):
             todas_J.append([al])
             todas_K.append([parse_data_br(bi)])
 
-        total_linhas += len(valores)
+        total_linhas += len(dados)
         log(f"   ✅ Acumulado: {total_linhas} linhas")
     except Exception as e:
         log(f"⚠️  Falha ao processar origem {origem_id}: {e} — continuando…")
@@ -189,7 +219,14 @@ for idx, origem_id in enumerate(ORIGENS, 1):
 log(f"🧮 Total consolidado: {len(todos_FI)} linhas úteis")
 
 # ========= LIMPEZA DESTINO =========
-safe_clear(ws_dst, ["F2:I", "J2:J", "K2:K"])
+# Evita intervalos “infinitos”: limpa até a última linha existente
+end_row = ws_dst.row_count if ws_dst.row_count and ws_dst.row_count > 1 else 2
+faixas_limpeza = [
+    f"F2:I{end_row}",
+    f"J2:J{end_row}",
+    f"K2:K{end_row}",
+]
+safe_clear(ws_dst, faixas_limpeza)
 
 # ========= UPLOAD (EM BLOCOS) =========
 if todos_FI:
