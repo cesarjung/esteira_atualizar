@@ -61,7 +61,11 @@ def make_creds():
     env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if env_path and os.path.isfile(env_path):
         return SACreds.from_service_account_file(env_path, scopes=SCOPES)
-    return SACreds.from_service_account_file(pathlib.Path('credenciais.json'), scopes=SCOPES)
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / 'credenciais.json', pathlib.Path.cwd() / 'credenciais.json'):
+        if p.is_file():
+            return SACreds.from_service_account_file(p, scopes=SCOPES)
+    raise FileNotFoundError("Credenciais não encontradas (GOOGLE_CREDENTIALS, GOOGLE_APPLICATION_CREDENTIALS ou credenciais.json).")
 
 # ========= RETRY/UTILS =========
 def _status_code(e: APIError):
