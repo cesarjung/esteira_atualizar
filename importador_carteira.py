@@ -16,6 +16,13 @@ from gspread.utils import rowcol_to_a1, a1_to_rowcol
 from google.oauth2.service_account import Credentials as SACreds
 from google.auth.transport.requests import Request as GARequest
 
+# ───────── FUSO (opcional; não altera a lógica) ─────────
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
+
 # ───────── CONFIG ─────────
 ORIGEM_ID   = '1lUNIeWCddfmvJEjWJpQMtuR4oRuMsI3VImDY0xBp3Bs'
 DESTINO_ID  = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
