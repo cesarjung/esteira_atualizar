@@ -11,6 +11,13 @@ from typing import Optional
 
 import pandas as pd
 
+# ====== FUSO (opcional; não altera a lógica) ======
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
+
 # ====== checagem amigável de dependências do Google API ======
 try:
     from googleapiclient.discovery import build
