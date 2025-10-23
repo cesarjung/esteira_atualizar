@@ -9,6 +9,13 @@ from datetime import datetime
 import os, re, time, sys, json, random, pathlib
 from typing import List, Optional
 
+# ====== FUSO (opcional; não altera a lógica) ======
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
+
 import gspread
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
