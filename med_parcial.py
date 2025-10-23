@@ -2,18 +2,13 @@ import os
 import re
 import time
 import random
+import json
+import pathlib
 import pandas as pd
 import gspread
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, WorksheetNotFound
-
-# ====== FUSO (opcional; não altera a lógica) ======
-os.environ.setdefault("TZ", "America/Sao_Paulo")
-try:
-    import time as _t; _t.tzset()
-except Exception:
-    pass
 
 # ================== FLAGS ==================
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
@@ -23,7 +18,7 @@ ID_PLANILHA_ORIGEM  = "19xV_P6KIoZB9U03yMcdRb2oF_Q7gVdaukjAvE4xOvl8"
 ID_PLANILHA_DESTINO = "1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM"
 ABA_ORIGEM          = "MED PARCIAIS GERAL"
 ABA_DESTINO         = "MED PARCIAL"
-CAMINHO_CREDENCIAIS = "credenciais.json"
+CAMINHO_CREDENCIAIS = "credenciais.json"  # fallback
 
 CHUNK_ROWS  = 2000
 MAX_RETRIES = 6
@@ -33,6 +28,22 @@ TRANSIENT   = {429, 500, 502, 503, 504}
 # ================== LOG ====================
 def now(): return datetime.now().strftime("%H:%M:%S")
 def log(msg): print(f"[{now()}] {msg}", flush=True)
+
+# ===== CREDENCIAIS FLEXÍVEIS =====
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+def make_creds():
+    env_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if env_json:
+        return Credentials.from_service_account_info(json.loads(env_json), scopes=SCOPES)
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return Credentials.from_service_account_file(env_path, scopes=SCOPES)
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / CAMINHO_CREDENCIAIS, pathlib.Path.cwd() / CAMINHO_CREDENCIAIS):
+        if p.is_file():
+            return Credentials.from_service_account_file(str(p), scopes=SCOPES)
+    raise FileNotFoundError("Credenciais não encontradas (envs ou credenciais.json).")
 
 # ===== RETRY com backoff + jitter ==========
 def _status_code(e: APIError):
@@ -56,8 +67,8 @@ def with_retry(func, *args, retries=MAX_RETRIES, base=BASE_SLEEP, desc="", **kwa
 
 # ============ Helpers de planilha ==========
 def ensure_size(ws, rows, cols):
-    rows = max(rows, 2)   # pelo menos 2 linhas
-    cols = max(cols, 18)  # R1 exige >= 18 colunas (A..R)
+    rows = max(rows, 2)
+    cols = max(cols, 18)  # R
     if ws.row_count < rows or ws.col_count < cols:
         log(f"🧩 Ajustando grade: linhas {ws.row_count}->{rows}, colunas {ws.col_count}->{cols}")
         with_retry(ws.resize, rows, cols, desc="resize destino")
@@ -68,16 +79,12 @@ def safe_clear(ws, a1):
 
 def safe_update(ws, a1, values):
     log(f"✍️  Update em {a1} ({len(values)} linhas)")
-    with_retry(ws.update, range_name=a1, values=values, value_input_option="USER_ENTERED",
-               desc=f"update {a1}")
+    with_retry(ws.update, range_name=a1, values=values, value_input_option="USER_ENTERED", desc=f"update {a1}")
 
 def chunked_update(ws, values, start_row=1, start_col='A', end_col='P'):
     n = len(values)
-    if n == 0:
-        return
-    i = 0
-    bloco = 0
-    t0 = time.time()
+    if n == 0: return
+    i = 0; bloco = 0; t0 = time.time()
     while i < n:
         part = values[i:i+CHUNK_ROWS]
         a1 = f"{start_col}{start_row + i}:{end_col}{start_row + i + len(part) - 1}"
@@ -85,7 +92,7 @@ def chunked_update(ws, values, start_row=1, start_col='A', end_col='P'):
         log(f"🚚 Enviando bloco {bloco} — linhas {start_row+i}..{start_row+i+len(part)-1} de {n}")
         safe_update(ws, a1, part)
         i += len(part)
-        time.sleep(0.12)  # alivia write/min
+        time.sleep(0.12)
     log(f"✅ Upload concluído em {time.time() - t0:.1f}s ({n} linhas)")
 
 # ================== INÍCIO =================
@@ -94,9 +101,7 @@ log("🚀 Iniciando MED PARCIAL")
 
 # ---- Autenticação
 log("🔐 Autenticando no Google…")
-escopos = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-credenciais = Credentials.from_service_account_file(CAMINHO_CREDENCIAIS, scopes=escopos)
-gc = gspread.authorize(credenciais)
+gc = gspread.authorize(make_creds())
 
 # ---- Abertura
 log(f"📂 Abrindo origem/destino…")
@@ -111,7 +116,6 @@ except WorksheetNotFound:
     aba_destino = with_retry(planilha_destino.add_worksheet, title=ABA_DESTINO, rows=1000, cols=18,
                              desc="add_worksheet destino")
 
-# Garante grade antes de qualquer escrita
 ensure_size(aba_destino, aba_destino.row_count, 18)
 
 # ---- Status inicial
@@ -134,26 +138,20 @@ log(f"🔎 Linhas carregadas (sem cabeçalho): {len(dados)}")
 # ---- Tratamento numérico (F e J na origem)
 log("🧽 Limpando valores numéricos (F,J)…")
 def limpar_valor(valor):
-    if valor is None:
-        return ""
+    if valor is None: return ""
     try:
-        if pd.isna(valor):
-            return ""
+        if pd.isna(valor): return ""
     except Exception:
         pass
     s = str(valor)
-    s = re.sub(r"[^\d,.\-]", "", s)  # mantém dígitos, , . -
+    s = re.sub(r"[^\d,.\-]", "", s)
     s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return ""
+    try: return float(s)
+    except Exception: return ""
 
 for linha in dados:
-    if len(linha) >= 6:
-        linha[5] = limpar_valor(linha[5])   # F (origem)
-    if len(linha) >= 10:
-        linha[9] = limpar_valor(linha[9])   # J (origem)
+    if len(linha) >= 6:  linha[5] = limpar_valor(linha[5])   # F
+    if len(linha) >= 10: linha[9] = limpar_valor(linha[9])   # J
 
 # ---- Coluna A: PROJETO CORRIGIDO (9 primeiros de B)
 log("🧮 Montando A: PROJETO CORRIGIDO…")
@@ -164,17 +162,13 @@ limite_linhas = len(dados) + 1
 log(f"📏 Tamanho a escrever: {limite_linhas} linhas × 16 colunas (B:P) + A")
 ensure_size(aba_destino, limite_linhas, 18)
 
-# === Limpeza completa (A:P) para não sobrar resíduos ===
 safe_clear(aba_destino, "A:P")
 
-# ---- Escreve A1:A{n}
 log(f"📤 Colando A1:A{limite_linhas}…")
 chunked_update(aba_destino, projetos_corrigidos, start_row=1, start_col="A", end_col="A")
 
-# ---- Preparar dados B..P (remove col A da origem)
 dados_completo = [linha[1:] for linha in [cabecalho] + dados]
 
-# ---- Colar B1:P{n}
 intervalo_destino = f"B1:P{limite_linhas}"
 log(f"📤 Colando {intervalo_destino} (USER_ENTERED)…")
 chunked_update(aba_destino, dados_completo, start_row=1, start_col="B", end_col="P")
@@ -184,19 +178,14 @@ if FORCAR_FORMATACAO and limite_linhas > 1:
     try:
         log("🎨 Aplicando formatação opcional…")
         sheet_id = aba_destino._properties['sheetId']
-        start_row_idx = 1          # a partir da linha 2
+        start_row_idx = 1
         end_row_idx   = limite_linhas
 
         def repeat_num(col_idx):
             return {
                 "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": start_row_idx,
-                        "endRowIndex": end_row_idx,
-                        "startColumnIndex": col_idx,
-                        "endColumnIndex": col_idx + 1
-                    },
+                    "range": {"sheetId": sheet_id, "startRowIndex": start_row_idx, "endRowIndex": end_row_idx,
+                              "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}},
                     "fields": "userEnteredFormat.numberFormat"
                 }
@@ -205,27 +194,14 @@ if FORCAR_FORMATACAO and limite_linhas > 1:
         def repeat_date(col_idx):
             return {
                 "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": start_row_idx,
-                        "endRowIndex": end_row_idx,
-                        "startColumnIndex": col_idx,
-                        "endColumnIndex": col_idx + 1
-                    },
+                    "range": {"sheetId": sheet_id, "startRowIndex": start_row_idx, "endRowIndex": end_row_idx,
+                              "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
                     "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}}},
                     "fields": "userEnteredFormat.numberFormat"
                 }
             }
 
-        # Destino: B..P  -> índices: B=1 ... P=15
-        reqs = {
-            "requests": [
-                repeat_num(6),   # G (valor a receber)
-                repeat_num(10),  # K (valor faturado)
-                repeat_date(7),  # H (data)
-                repeat_date(9),  # J (data)
-            ]
-        }
+        reqs = {"requests": [repeat_num(6), repeat_num(10), repeat_date(7), repeat_date(9)]}
         with_retry(aba_destino.spreadsheet.batch_update, reqs, desc="batch_update formato")
         log("✅ Formatação aplicada.")
     except APIError as e:
