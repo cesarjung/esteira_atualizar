@@ -1,19 +1,15 @@
+# lv.py — usa credenciais flexíveis (env ou arquivo), mantém o restante do fluxo intacto
 import os
 import re
 import time
 import random
+import json
+import pathlib
 import pandas as pd
 import gspread
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, WorksheetNotFound
-
-# ====== FUSO (opcional; não altera a lógica) ======
-os.environ.setdefault("TZ", "America/Sao_Paulo")
-try:
-    import time as _t; _t.tzset()
-except Exception:
-    pass
 
 # ====== FLAG: formatação opcional (desligada por padrão) ======
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
@@ -25,7 +21,7 @@ RANGE_ORIGEM  = 'A:Y'   # inclui cabeçalho
 
 ID_DESTINO    = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA_DESTINO   = 'LV CICLO'
-CAM_CRED      = 'credenciais.json'
+CAM_CRED      = 'credenciais.json'  # fallback local
 
 CHUNK_ROWS    = 2000
 MAX_RETRIES   = 6
@@ -43,9 +39,27 @@ def _status_from_apierror(e: APIError):
     m = re.search(r"\[(\d+)\]", str(e))
     return int(m.group(1)) if m else None
 
-# ====== AUTENTICAÇÃO ======
-escopos = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-cred = Credentials.from_service_account_file(CAM_CRED, scopes=escopos)
+# ====== AUTENTICAÇÃO (flexível p/ GitHub Actions) ======
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+
+def make_creds():
+    env_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if env_json:
+        return Credentials.from_service_account_info(json.loads(env_json), scopes=SCOPES)
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return Credentials.from_service_account_file(env_path, scopes=SCOPES)
+    # fallback local
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / CAM_CRED, pathlib.Path.cwd() / CAM_CRED):
+        if p.is_file():
+            return Credentials.from_service_account_file(str(p), scopes=SCOPES)
+    raise FileNotFoundError(
+        "Credenciais não encontradas. Defina GOOGLE_CREDENTIALS (JSON inline) "
+        "ou GOOGLE_APPLICATION_CREDENTIALS (caminho do .json) ou mantenha 'credenciais.json'."
+    )
+
+cred = make_creds()
 gc = gspread.authorize(cred)
 
 # ====== RETRY COM BACKOFF + JITTER ======
@@ -102,7 +116,6 @@ def chunked_update(ws, values, start_row=1, start_col='A', end_col='Y'):
     log(f"✅ Upload concluído em {time.time() - t0:.1f}s ({n} linhas)")
 
 def reopen_ws_if_404(book, title, ws, desc="reopen ws"):
-    """Reabre a worksheet em caso de 404 (cache/propagação)."""
     try:
         return with_retry(book.worksheet, title, desc=desc)
     except Exception:
@@ -160,7 +173,6 @@ log("🧽 Tratando colunas numéricas e data…")
 num_cols = [5, 10, 19, 21, 22]  # F, K, T, V, W (0-based)
 date_col = 7                     # H (0-based)
 
-# Números (linhas a partir da 2)
 for c in num_cols:
     if c < df.shape[1]:
         s = (df.iloc[1:, c].astype(str)
@@ -172,7 +184,6 @@ for c in num_cols:
              .str.replace(",", ".", regex=False))
         df.iloc[1:, c] = pd.to_numeric(s, errors='coerce')
 
-# Datas
 if date_col < df.shape[1]:
     serie = (df.iloc[1:, date_col].astype(str)
              .str.replace("’", "", regex=False)
@@ -182,7 +193,6 @@ if date_col < df.shape[1]:
     dt = pd.to_datetime(serie, dayfirst=True, errors='coerce')
     df.iloc[1:, date_col] = dt.dt.strftime('%d/%m/%Y')
 
-# Troca NaN/NaT por vazio
 df = df.where(pd.notnull(df), "")
 
 # ====== PREPARA ESCRITA ======
@@ -200,7 +210,6 @@ except APIError as e:
     else:
         raise
 
-# Converte DF e envia em blocos
 values = df.values.tolist()
 chunked_update(ws_dst, values, start_row=1, start_col='A', end_col='Y')
 
@@ -209,8 +218,8 @@ if FORCAR_FORMATACAO and n_rows > 1:
     try:
         log("🎨 Aplicando formatação opcional…")
         sheet_id = ws_dst._properties['sheetId']
-        start_row_idx = 1       # linha 2 (dados)
-        end_row_idx = n_rows    # até última linha
+        start_row_idx = 1
+        end_row_idx = n_rows
 
         def repeat_num(col_idx):
             return {
@@ -242,16 +251,7 @@ if FORCAR_FORMATACAO and n_rows > 1:
                 }
             }
 
-        reqs = {
-            "requests": [
-                repeat_num(5),   # F
-                repeat_num(10),  # K
-                repeat_num(19),  # T
-                repeat_num(21),  # V
-                repeat_num(22),  # W
-                repeat_date(7),  # H
-            ]
-        }
+        reqs = {"requests": [repeat_num(5), repeat_num(10), repeat_num(19), repeat_num(21), repeat_num(22), repeat_date(7)]}
         with_retry(ws_dst.spreadsheet.batch_update, reqs, desc="batch_update formato")
         log("✅ Formatação aplicada.")
     except APIError as e:
