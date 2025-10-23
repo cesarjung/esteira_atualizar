@@ -1,32 +1,4 @@
-# === GitHub Actions-friendly Google credentials helper ===
-import os, json, pathlib
-from google.oauth2.service_account import Credentials as SACreds
-Credentials = SACreds  # retrocompatibilidade (se o código antigo referir 'Credentials')
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
-
-def make_creds():
-    env_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if env_json:
-        try:
-            return SACreds.from_service_account_info(json.loads(env_json), scopes=SCOPES)
-        except Exception as e:
-            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
-    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if env_path and os.path.isfile(env_path):
-        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
-    script_dir = pathlib.Path(__file__).resolve().parent
-    for p in (script_dir / "credenciais.json", pathlib.Path.cwd() / "credenciais.json"):
-        if p.is_file():
-            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
-    raise FileNotFoundError(
-        "Credenciais não encontradas. Defina GOOGLE_CREDENTIALS com o JSON "
-        "ou GOOGLE_APPLICATION_CREDENTIALS com o caminho do .json, "
-        "ou mantenha 'credenciais.json' local."
-    )
-# === end helper ===
-# cart_plan.py — revisado (values_get, credenciais flexíveis, clears explícitos)
+# cart_plan.py — pronto para GitHub Actions (sem mudança de lógica)
 import os
 import re
 import time
@@ -37,7 +9,7 @@ import gspread
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-from google.oauth2.service_account import Credentials as SACreds as SACreds
+from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # ========= FLAGS =========
@@ -46,6 +18,13 @@ CHUNK_ROWS        = int(os.environ.get("CHUNK_ROWS", "3000"))
 MAX_RETRIES       = 6
 BASE_SLEEP        = 1.0
 TRANSIENT_CODES   = {429, 500, 502, 503, 504}
+
+# ========= FUSO (opcional; não altera a lógica) =========
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
 
 # ========= LOG =========
 def now(): return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
