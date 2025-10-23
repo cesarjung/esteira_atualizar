@@ -1,31 +1,3 @@
-# === GitHub Actions-friendly Google credentials helper ===
-import os, json, pathlib
-from google.oauth2.service_account import Credentials as SACreds
-Credentials = SACreds  # retrocompatibilidade (se o código antigo referir 'Credentials')
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
-
-def make_creds():
-    env_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if env_json:
-        try:
-            return SACreds.from_service_account_info(json.loads(env_json), scopes=SCOPES)
-        except Exception as e:
-            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
-    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if env_path and os.path.isfile(env_path):
-        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
-    script_dir = pathlib.Path(__file__).resolve().parent
-    for p in (script_dir / "credenciais.json", pathlib.Path.cwd() / "credenciais.json"):
-        if p.is_file():
-            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
-    raise FileNotFoundError(
-        "Credenciais não encontradas. Defina GOOGLE_CREDENTIALS com o JSON "
-        "ou GOOGLE_APPLICATION_CREDENTIALS com o caminho do .json, "
-        "ou mantenha 'credenciais.json' local."
-    )
-# === end helper ===
 import os
 import re
 import time
@@ -33,9 +5,16 @@ import random
 import pandas as pd
 import gspread
 from datetime import datetime, date
-from google.oauth2.service_account import Credentials as SACreds
+from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, WorksheetNotFound
 from gspread.utils import rowcol_to_a1
+
+# ====== FUSO (opcional; não altera a lógica) ======
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
 
 # ================== FLAGS ==================
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
@@ -141,7 +120,7 @@ log("🚀 Iniciando OPERACAO")
 # ---- Autenticação
 log("🔐 Autenticando…")
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-cred = make_creds()
+cred = Credentials.from_service_account_file(CAM_CRED, scopes=scopes)
 gc = gspread.authorize(cred)
 
 # ---- Abertura
