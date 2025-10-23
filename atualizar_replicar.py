@@ -1,9 +1,33 @@
-# atualizar_replicar.py
-# Orquestrador: executa BLOCO 1 e BLOCO 2 com controle em BD_Config e, se OK, roda as réplicas.
-# Credenciais aceitas via:
-#   1) GOOGLE_CREDENTIALS (JSON inline)
-#   2) GOOGLE_APPLICATION_CREDENTIALS (caminho do .json)
-#   3) credenciais.json no diretório do script ou no diretório atual
+# === GitHub Actions-friendly Google credentials helper ===
+import os, json, pathlib
+from google.oauth2.service_account import Credentials as SACreds
+Credentials = SACreds  # retrocompat
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive"]
+
+def make_creds():
+    env_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if env_json:
+        try:
+            return SACreds.from_service_account_info(json.loads(env_json), scopes=SCOPES)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.isfile(env_path):
+        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / "credenciais.json", pathlib.Path.cwd() / "credenciais.json"):
+        if p.is_file():
+            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
+    raise FileNotFoundError(
+        "Credenciais não encontradas. Defina GOOGLE_CREDENTIALS com o JSON "
+        "ou GOOGLE_APPLICATION_CREDENTIALS com o caminho do .json, "
+        "ou mantenha 'credenciais.json' local."
+    )
+# === end helper ===
+
+# atualizar_replicar.py — Orquestrador com controle BD_Config e réplicas
 
 import os, re, json, time, random, pathlib
 from datetime import datetime
@@ -19,7 +43,7 @@ from google.oauth2.service_account import Credentials as SACreds
 # =======================
 # CONFIGURAÇÕES GERAIS
 # =======================
-CREDENTIALS_PATH = "credenciais.json"  # fallback local
+CREDENTIALS_PATH = "credenciais.json"  # usado apenas como fallback local
 SPREADSHEET_ID = "1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM"
 BD_CONFIG_SHEET = "BD_Config"
 
@@ -34,10 +58,9 @@ MAX_API_RETRIES = 6
 BASE_SLEEP = 1.1
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
-# Passos de atualização
 BLOCK1 = [
     ("ciclo.py",        2),
-    ("lv.py",           3),  # <- case corrigido para lv.py
+    ("lv.py",           3),
     ("med_parcial.py",  4),
     ("operacao.py",     5),
 ]
@@ -67,7 +90,7 @@ SCRIPTS_REPLICA = [
 ]
 
 # =======================
-# UTILITÁRIOS COMUNS
+# UTILITÁRIOS
 # =======================
 _STATUS_CACHE: Dict[int, str] = {}
 
@@ -87,41 +110,23 @@ def _sleep_backoff(attempt: int, base: float = BASE_SLEEP):
     s = min(60.0, base * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
     time.sleep(s)
 
-# ========= CREDENCIAIS ROBUSTAS =========
-def make_creds():
-    env_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if env_json:
-        try:
-            info = json.loads(env_json)
-            return SACreds.from_service_account_info(info, scopes=SCOPES)
-        except Exception as e:
-            raise RuntimeError(f"GOOGLE_CREDENTIALS inválido: {e}")
-
-    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if env_path and os.path.isfile(env_path):
-        return SACreds.from_service_account_file(env_path, scopes=SCOPES)
-
-    script_dir = pathlib.Path(__file__).resolve().parent
-    for p in (script_dir / CREDENTIALS_PATH, pathlib.Path.cwd() / CREDENTIALS_PATH):
-        if p.is_file():
-            return SACreds.from_service_account_file(str(p), scopes=SCOPES)
-
-    raise FileNotFoundError(
-        "Não encontrei credenciais do Google. Use GOOGLE_CREDENTIALS (JSON inline), "
-        "GOOGLE_APPLICATION_CREDENTIALS (caminho do .json) ou credenciais.json."
-    )
+# ========= CREDENCIAIS =========
+def make_creds_orchestrator():
+    # Reusa o helper acima
+    return make_creds()
 
 def get_ws():
-    creds = make_creds()
+    creds = make_creds_orchestrator()
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
     return sh.worksheet(BD_CONFIG_SHEET)
 
-# -------- writes compactadas (evita 429) --------
+# -------- writes compactadas (D & E) com fallback quotado --------
 def _update_DE_row(ws, row: int, d_val: str, e_val: str):
     attempt = 0
     while True:
         try:
+            # caminho “normal” (gspread geralmente qualifica o título)
             return ws.update(
                 range_name=f"D{row}:E{row}",
                 values=[[d_val, e_val]],
@@ -130,8 +135,26 @@ def _update_DE_row(ws, row: int, d_val: str, e_val: str):
         except APIError as e:
             attempt += 1
             code = _status_code_from_apierror(e)
-            if attempt >= MAX_API_RETRIES or code not in RETRYABLE_CODES:
+
+            # Fallback específico para 404: força range qualificado com o título da aba entre aspas
+            if code == 404:
+                try:
+                    rng = f"'{ws.title}'!D{row}:E{row}"
+                    return ws.spreadsheet.values_update(
+                        rng,
+                        params={"valueInputOption": "USER_ENTERED"},
+                        body={"values": [[d_val, e_val]]},
+                    )
+                except APIError as e2:
+                    code2 = _status_code_from_apierror(e2)
+                    if attempt >= MAX_API_RETRIES or (code2 is not None and code2 not in RETRYABLE_CODES):
+                        raise
+                    _sleep_backoff(attempt)
+                    continue
+
+            if attempt >= MAX_API_RETRIES or (code is not None and code not in RETRYABLE_CODES):
                 raise
+
             if code == 429:
                 wait = min(60.0, 5.0 * attempt + random.uniform(0, 2.0))
                 print(f"[update_DE] ⚠️  429 — aguardando {wait:.1f}s (linha {row})", flush=True)
@@ -152,12 +175,12 @@ def set_fail(ws, row: int):
     _STATUS_CACHE[row] = "Falhou"
     _update_DE_row(ws, row, fmt_now(), "Falhou")
 
-# -------- leitura resiliente por Values API + cache --------
+# -------- leitura resiliente por Values API --------
 def _values_get_resilient(sh, a1_range: str, desc: str, max_retries: int = MAX_API_RETRIES):
     attempt = 0
     while True:
         try:
-            resp = sh.values_get(a1_range)  # dict
+            resp = sh.values_get(a1_range)  # retorna dict
             return resp.get("values", []) or []
         except APIError as e:
             attempt += 1
@@ -170,6 +193,7 @@ def _values_get_resilient(sh, a1_range: str, desc: str, max_retries: int = MAX_A
 def get_status_map(ws, rows: List[int]) -> Dict[int, str]:
     if not rows:
         return {}
+
     out: Dict[int, str] = {}
     missing: List[int] = []
     for r in rows:
@@ -177,21 +201,25 @@ def get_status_map(ws, rows: List[int]) -> Dict[int, str]:
             out[r] = _STATUS_CACHE[r]
         else:
             missing.append(r)
+
     if not missing:
         return out
+
     lo, hi = min(missing), max(missing)
     a1 = f"{BD_CONFIG_SHEET}!E{lo}:E{hi}"
     data = _values_get_resilient(ws.spreadsheet, a1, desc="get_status_map(values_get)")
+
     for i, rr in enumerate(range(lo, hi + 1)):
         v = ""
         if i < len(data) and data[i] and len(data[i]) > 0:
             v = (data[i][0] or "").strip()
         out.setdefault(rr, v)
         _STATUS_CACHE.setdefault(rr, v)
+
     return {r: out.get(r, "") for r in rows}
 
 # =======================
-# EXECUÇÃO DOS PASSOS (ATUALIZAÇÃO)
+# EXECUÇÃO DOS PASSOS
 # =======================
 def run_script(script_path: Path, idx: int, total: int, attempt: int) -> int:
     start = time.perf_counter()
@@ -229,18 +257,21 @@ def ensure_block(ws, base_dir: Path, steps: List[Tuple[str, int]], idx_offset: i
         executed += 1
         run_step(ws, base_dir, script, row, idx_offset + i, idx_offset + total_planned, attempts[row])
 
-    time.sleep(0.7)  # assentar
+    time.sleep(0.7)
 
-    # Reexecuta somente pendentes
+    # Reexecuta apenas pendentes
     while True:
         status = get_status_map(ws, [row for _, row in steps])
         pending = [(s, r) for s, r in steps if (status.get(r, "").strip().upper() != "OK")]
+
         if not pending:
             break
+
         time.sleep(0.6)
+
         for script, row in pending:
             if attempts[row] >= MAX_ATTEMPTS_PER_STEP:
-                print(f"⚠️  Máximo de tentativas atingido para {script} (E{row} ainda != OK).", flush=True)
+                print(f"⚠️  Máximo de tentativas atingido para {script} (linha E{row} ainda != OK).", flush=True)
                 continue
             attempts[row] += 1
             executed += 1
@@ -341,7 +372,7 @@ def main():
     banner("PIPELINE – Atualização com controle de status na aba BD_Config")
     overall_start = time.perf_counter()
 
-    # -------- BLOCO 1 --------
+    # BLOCO 1
     banner("BLOCO 1: ciclo → lv → med_parcial → operacao")
     _ = ensure_block(ws, base_dir, BLOCK1, idx_offset=0)
     status_b1 = get_status_map(ws, [row for _, row in BLOCK1])
@@ -351,7 +382,7 @@ def main():
         banner(f"FIM (INTERROMPIDO) – Tempo total: {total_time:.1f}s")
         sys.exit(1)
 
-    # -------- BLOCO 2 --------
+    # BLOCO 2
     banner("BLOCO 2: zps_importador → cart_plan → bd_exec → importador_carteira")
     _ = ensure_block(ws, base_dir, BLOCK2, idx_offset=len(BLOCK1))
     status_b2 = get_status_map(ws, [row for _, row in BLOCK2])
@@ -361,10 +392,11 @@ def main():
         banner(f"FIM (INTERROMPIDO) – Tempo total: {total_time:.1f}s")
         sys.exit(1)
 
+    # Timestamp padrão do pipeline após atualizações
     _update_DE_row(ws, 1, fmt_now(), "OK (BLOCOS 1+2)")
     print("✅ Atualizações OK. Timestamp gravado em BD_Config!D1:E1.", flush=True)
 
-    # -------- RÉPLICAS --------
+    # RÉPLICAS
     ok_replicas = run_replicas(base_dir)
 
     total_time = time.perf_counter() - overall_start
