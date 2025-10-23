@@ -13,6 +13,13 @@ __VERSION__ = "ciclo.py v2 no-hardclear"
 
 print(f">>> {__VERSION__} — caminho: {__file__}", flush=True)
 
+# ========= FUSO (opcional; não altera a lógica) =========
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
+
 # =========================
 # CONFIG
 # =========================
@@ -30,8 +37,10 @@ SRC_WIDTH = 20
 DEST_START_NUM = 4
 DEST_END_NUM   = DEST_START_NUM + SRC_WIDTH - 1
 def _num_to_col(n: int) -> str:
-    s = ""; 
-    while n: n, r = divmod(n-1, 26); s = chr(65+r)+s
+    s = ""
+    while n:
+        n, r = divmod(n-1, 26)
+        s = chr(65+r)+s
     return s
 DEST_END_LET = _num_to_col(DEST_END_NUM)
 
