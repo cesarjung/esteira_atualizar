@@ -8,6 +8,13 @@ from datetime import datetime
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, WorksheetNotFound
 
+# ====== FUSO (opcional; não altera a lógica) ======
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
+
 # ================== FLAGS ==================
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
 
