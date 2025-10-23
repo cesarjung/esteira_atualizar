@@ -8,6 +8,13 @@ import os, json, pathlib
 import random
 from typing import List, Tuple
 
+# ==== Fuso horário (opcional; não altera a lógica) ====
+os.environ.setdefault("TZ", "America/Sao_Paulo")
+try:
+    import time as _t; _t.tzset()
+except Exception:
+    pass
+
 import gspread
 from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials as SACreds
@@ -47,10 +54,20 @@ def make_creds():
     env = os.environ.get('GOOGLE_CREDENTIALS')
     if env:
         return SACreds.from_service_account_info(json.loads(env), scopes=SCOPES)
+
     env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if env_path and os.path.isfile(env_path):
         return SACreds.from_service_account_file(env_path, scopes=SCOPES)
-    return SACreds.from_service_account_file(pathlib.Path('credenciais.json'), scopes=SCOPES)
+
+    script_dir = pathlib.Path(__file__).resolve().parent
+    for p in (script_dir / 'credenciais.json', pathlib.Path.cwd() / 'credenciais.json'):
+        if p.is_file():
+            return SACreds.from_service_account_file(p, scopes=SCOPES)
+
+    raise FileNotFoundError(
+        "Credenciais não encontradas. Defina GOOGLE_CREDENTIALS (JSON) "
+        "ou GOOGLE_APPLICATION_CREDENTIALS (caminho) ou coloque 'credenciais.json'."
+    )
 
 # ========= RETRY / UTILS =========
 def agora():
