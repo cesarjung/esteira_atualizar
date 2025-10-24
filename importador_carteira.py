@@ -1,4 +1,4 @@
-# importador_carteira.py — resiliente, com N tentativas antes de seguir (soft-fail)
+# importador_carteira.py — robusto (não pula etapa), com re-open e re-resolve em 404/503
 
 import os
 import re
@@ -18,31 +18,30 @@ from google.oauth2.service_account import Credentials as SACreds
 # ================== CONFIG ==================
 SPREADSHEET_ID_MASTER   = "1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM"
 
-ABA_CARTEIRA_DESTINO    = "Carteira"           # destino
-RANGE_ORIGEM_PRINCIPAL  = "A5:CS"              # base principal (já existente)
+ABA_CARTEIRA_DESTINO    = "Carteira"     # destino e também origem da base principal
+RANGE_ORIGEM_PRINCIPAL  = "A5:CS"
 
 USAR_CICLO_COMPLEMENTAR = True
 ABA_CICLO               = "CICLO"
-RANGE_CICLO             = "D1:T"               # cabeçalho + dados
+RANGE_CICLO             = "D1:T"
 
 USAR_LV_COMPLEMENTAR    = True
 ABA_LV_CICLO            = "LV CICLO"
-RANGE_LV                = "A1:Y"               # cabeçalho + dados
+RANGE_LV                = "A1:Y"
 
 # escrita / limpeza
 BLOCK_ROWS              = int(os.environ.get("CHUNK_ROWS", "2000"))
-PAUSE_BETWEEN_WRITES    = 0.10
+PAUSE_BETWEEN_WRITES    = 0.08
 EXTRA_TAIL_ROWS         = 200
 
-# retry (API)
+# retry / backoff
 TRANSIENT_CODES         = {429, 500, 502, 503, 504}
-MAX_RETRIES_API         = 6
-BASE_SLEEP_API          = 1.0
+MAX_RETRIES_API         = 8        # por operação baixa-nível (get/update/clear)
+BASE_SLEEP_API          = 0.8
 
-# retry (resolução de abas / leituras)
-RESOLVE_ATTEMPTS        = 5     # tentativas para achar a aba
-READ_ATTEMPTS           = 5     # tentativas para ler o intervalo
-BASE_SLEEP_META         = 1.2   # base de backoff para metadata/leituras
+# tentativas “macro” (garantia de etapa): quantas vezes reabrimos/voltamos tudo antes de desistir
+MAX_PASSOS_HARD         = 18       # ~18 ciclos, com backoff curto, ~5–10 min de insistência total
+BASE_SLEEP_HARD         = 0.9
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -61,7 +60,7 @@ def _status(e: APIError) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 def with_retry(fn, *args, desc="", **kwargs):
-    """Retry para chamadas gspread (update/clear/etc.)."""
+    """Retry curto para chamadas gspread (update/get/clear/resize...)."""
     for tent in range(1, MAX_RETRIES_API + 1):
         try:
             return fn(*args, **kwargs)
@@ -70,7 +69,7 @@ def with_retry(fn, *args, desc="", **kwargs):
             if code not in TRANSIENT_CODES or tent >= MAX_RETRIES_API:
                 log(f"❌ {desc or fn.__name__} falhou: {e}")
                 raise
-            slp = min(60.0, BASE_SLEEP_API * (2 ** (tent - 1)) + random.uniform(0, 0.75))
+            slp = min(20.0, BASE_SLEEP_API * (1.6 ** (tent - 1)) + random.uniform(0, 0.5))
             log(f"⚠️  {desc or fn.__name__}: HTTP {code} — retry {tent}/{MAX_RETRIES_API-1} em {slp:.1f}s")
             time.sleep(slp)
 
@@ -140,74 +139,118 @@ def chunked_write(ws, start_row: int, start_col_1b: int, values: List[List]):
 def to_matrix(df: pd.DataFrame) -> List[List]:
     return [] if df.empty else df.values.tolist()
 
-# -------- busca de aba robusta (case-insensitive; ignora espaços) --------
 def _norm_title(t: str) -> str:
     return re.sub(r"\s+", " ", (t or "").strip().lower())
 
-def resolve_worksheet_with_retries(sh, desired_title: str) -> Optional[gspread.Worksheet]:
-    """Tenta achar a aba por diversas vezes (para contornar propagação/caches)."""
-    want = _norm_title(desired_title)
-    for tent in range(1, RESOLVE_ATTEMPTS + 1):
-        try:
-            # tentativa direta
-            return with_retry(sh.worksheet, desired_title, desc=f"worksheet {desired_title}")
-        except WorksheetNotFound:
-            pass
-        try:
-            meta = with_retry(sh.fetch_sheet_metadata, desc="fetch_sheet_metadata")
-            for s in meta.get("sheets", []):
-                title = s.get("properties", {}).get("title", "")
-                if _norm_title(title) == want:
-                    return with_retry(sh.worksheet, title, desc=f"worksheet {title} (equivalente)")
-        except APIError as e:
-            # se der APIError transitório, tratamos abaixo via pausa e próximo loop
-            code = _status(e)
-            if code not in TRANSIENT_CODES:
-                log(f"⚠️  Metadata falhou (não transitório): {e}")
-        # backoff antes da próxima tentativa
-        slp = min(30.0, BASE_SLEEP_META * (2 ** (tent - 1)) + random.uniform(0, 0.5))
-        log(f"🔎 '{desired_title}' não encontrada (tentativa {tent}/{RESOLVE_ATTEMPTS}) — tentando de novo em {slp:.1f}s")
-        time.sleep(slp)
-    return None
+def resolve_worksheet(sh, desired_title: str) -> Optional[gspread.Worksheet]:
+    """Resolve direto ou por metadata, sem logs ruidosos."""
+    try:
+        return with_retry(sh.worksheet, desired_title, desc=f"worksheet {desired_title}")
+    except WorksheetNotFound:
+        meta = with_retry(sh.fetch_sheet_metadata, desc="fetch_sheet_metadata")
+        want = _norm_title(desired_title)
+        for s in meta.get("sheets", []):
+            title = s.get("properties", {}).get("title", "")
+            if _norm_title(title) == want:
+                return with_retry(sh.worksheet, title, desc=f"worksheet {title} (equivalente)")
+        return None
 
-def read_values_with_retries(ws, a1: str) -> pd.DataFrame:
-    """Lê um intervalo tentando algumas vezes antes de desistir."""
-    for tent in range(1, READ_ATTEMPTS + 1):
-        try:
+def read_values_df(ws, a1: str) -> pd.DataFrame:
+    """Leitura usando values_get (ligeiramente mais estável) e fallback p/ ws.get."""
+    try:
+        resp = with_retry(ws.spreadsheet.values_get, f"'{ws.title}'!{a1}",
+                          params={"majorDimension": "ROWS"}, desc=f"values_get {ws.title}!{a1}")
+        values = resp.get("values", []) or []
+        return pd.DataFrame(values) if values else pd.DataFrame([])
+    except APIError as e:
+        code = _status(e)
+        if code in TRANSIENT_CODES:
+            # fallback para ws.get também com retry
             raw = with_retry(ws.get, a1, desc=f"get {ws.title}!{a1}") or []
             return pd.DataFrame(raw) if raw else pd.DataFrame([])
+        raise
+
+# ================== “HARD LOOP” ==================
+def hard_load_everything(gc) -> tuple[gspread.Worksheet, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Garante ler Carteira + (CICLO/LV se habilitados).
+    Reabre a planilha/resolve abas quando der 404/503.
+    Só retorna quando tudo estiver carregado (ou explode após MAX_PASSOS_HARD).
+    """
+    for passo in range(1, MAX_PASSOS_HARD + 1):
+        log(f"🔁 Passo {passo}/{MAX_PASSOS_HARD} — abrindo planilha e resolvendo abas…")
+        sh = with_retry(gc.open_by_key, SPREADSHEET_ID_MASTER, desc="open_by_key master")
+
+        ws_dest = resolve_worksheet(sh, ABA_CARTEIRA_DESTINO)
+        if ws_dest is None:
+            try:
+                ws_dest = with_retry(sh.add_worksheet, title=ABA_CARTEIRA_DESTINO, rows=2000, cols=100,
+                                     desc="add_worksheet Carteira")
+            except Exception as e:
+                log(f"⚠️  Não consegui abrir/criar '{ABA_CARTEIRA_DESTINO}': {e}")
+
+        ok_carteira = False
+        ok_ciclo    = not USAR_CICLO_COMPLEMENTAR
+        ok_lv       = not USAR_LV_COMPLEMENTAR
+
+        df_principal = pd.DataFrame([])
+        df_ciclo     = pd.DataFrame([])
+        df_lv        = pd.DataFrame([])
+
+        try:
+            if ws_dest is not None:
+                df_principal = read_values_df(ws_dest, RANGE_ORIGEM_PRINCIPAL)
+                ok_carteira = not df_principal.empty
+                if not ok_carteira:
+                    log("⚠️  Carteira vazia ou leitura falhou — tentando novamente.")
+            else:
+                log("⚠️  Worksheet 'Carteira' indisponível.")
         except APIError as e:
-            code = _status(e)
-            if code not in TRANSIENT_CODES:
-                log(f"❌ Leitura {ws.title}!{a1} falhou (não transitório): {e}")
-                break
-            slp = min(45.0, BASE_SLEEP_META * (2 ** (tent - 1)) + random.uniform(0, 0.5))
-            log(f"⚠️  Leitura {ws.title}!{a1}: HTTP {code} — retry {tent}/{READ_ATTEMPTS-1} em {slp:.1f}s")
-            time.sleep(slp)
-    return pd.DataFrame([])
+            log(f"⚠️  Falha lendo Carteira: {e}")
 
-# ================== COMPLEMENTOS ==================
-def try_load_ciclo(sh) -> pd.DataFrame:
-    if not USAR_CICLO_COMPLEMENTAR:
-        return pd.DataFrame([])
-    ws = resolve_worksheet_with_retries(sh, ABA_CICLO)
-    if ws is None:
-        log("ℹ️  Aba 'CICLO' indisponível após várias tentativas — seguindo sem complemento.")
-        return pd.DataFrame([])
-    df = read_values_with_retries(ws, RANGE_CICLO)
-    log(f"   ↳ CICLO: {len(df)} linhas × {df.shape[1]} colunas")
-    return df
+        # CICLO
+        if USAR_CICLO_COMPLEMENTAR:
+            try:
+                ws_ciclo = resolve_worksheet(sh, ABA_CICLO)
+                if ws_ciclo is None:
+                    log("⚠️  Aba 'CICLO' não encontrada.")
+                else:
+                    df_ciclo = read_values_df(ws_ciclo, RANGE_CICLO)
+                    ok_ciclo = not df_ciclo.empty
+                    if not ok_ciclo:
+                        log("⚠️  'CICLO' vazio ou leitura falhou — tentando novamente.")
+            except APIError as e:
+                log(f"⚠️  Falha lendo 'CICLO': {e}")
 
-def try_load_lv(sh) -> pd.DataFrame:
-    if not USAR_LV_COMPLEMENTAR:
-        return pd.DataFrame([])
-    ws = resolve_worksheet_with_retries(sh, ABA_LV_CICLO)
-    if ws is None:
-        log("ℹ️  Aba 'LV CICLO' indisponível após várias tentativas — seguindo sem complemento.")
-        return pd.DataFrame([])
-    df = read_values_with_retries(ws, RANGE_LV)
-    log(f"   ↳ LV CICLO: {len(df)} linhas × {df.shape[1]} colunas")
-    return df
+        # LV
+        if USAR_LV_COMPLEMENTAR:
+            try:
+                ws_lv = resolve_worksheet(sh, ABA_LV_CICLO)
+                if ws_lv is None:
+                    log("⚠️  Aba 'LV CICLO' não encontrada.")
+                else:
+                    df_lv = read_values_df(ws_lv, RANGE_LV)
+                    ok_lv = not df_lv.empty
+                    if not ok_lv:
+                        log("⚠️  'LV CICLO' vazio ou leitura falhou — tentando novamente.")
+            except APIError as e:
+                log(f"⚠️  Falha lendo 'LV CICLO': {e}")
+
+        if ok_carteira and ok_ciclo and ok_lv:
+            # Sucesso: todos os necessários carregados
+            log(f"🧱 Base principal: {len(df_principal)} linhas × {df_principal.shape[1]} colunas")
+            if USAR_CICLO_COMPLEMENTAR:
+                log(f"   ↳ CICLO: {len(df_ciclo)} linhas × {df_ciclo.shape[1]} colunas")
+            if USAR_LV_COMPLEMENTAR:
+                log(f"   ↳ LV CICLO: {len(df_lv)} linhas × {df_lv.shape[1]} colunas")
+            return ws_dest, df_principal, df_ciclo, df_lv
+
+        # espera breve e tenta tudo de novo (re-open/re-resolve)
+        slp = min(15.0, BASE_SLEEP_HARD * (1.5 ** (passo - 1)) + random.uniform(0, 0.6))
+        log(f"⏳ Ainda não consegui todos: Carteira={ok_carteira} CICLO={ok_ciclo} LV={ok_lv} — retry hard em {slp:.1f}s")
+        time.sleep(slp)
+
+    raise RuntimeError("Falha ao carregar Carteira/CICLO/LV após tentativas máximas.")
 
 # ================== MAIN ==================
 def main():
@@ -216,69 +259,45 @@ def main():
     creds = make_creds()
     gc = gspread.authorize(creds)
 
-    log("📂 Abrindo planilha master…")
-    sh = with_retry(gc.open_by_key, SPREADSHEET_ID_MASTER, desc="open_by_key master")
-
-    # destino (Carteira)
-    ws_dest = resolve_worksheet_with_retries(sh, ABA_CARTEIRA_DESTINO)
-    if ws_dest is None:
-        try:
-            ws_dest = with_retry(sh.add_worksheet, title=ABA_CARTEIRA_DESTINO, rows=2000, cols=100,
-                                 desc="add_worksheet Carteira")
-        except Exception as e:
-            log(f"⚠️  Não consegui abrir/criar 'Carteira'. Encerrando sem derrubar o pipeline. Detalhe: {e}")
-            return 0
-
-    # base principal (lida da própria Carteira A5:CS)
-    log("🧭 Lendo base principal (Carteira!A5:CS)…")
-    df_principal = read_values_with_retries(ws_dest, RANGE_ORIGEM_PRINCIPAL)
-    log(f"🧱 Base principal: {len(df_principal)} linhas × {df_principal.shape[1]} colunas")
-
-    # complementos — com várias tentativas antes de desistir
-    df_ciclo = try_load_ciclo(sh)
-    df_lv    = try_load_lv(sh)
+    # hard loop: não segue até tudo estar realmente carregado
+    ws_dest, df_principal, df_ciclo, df_lv = hard_load_everything(gc)
 
     # ======= PREPARO PARA ESCRITA =======
     values = to_matrix(df_principal)
     total_rows = len(values)
 
-    # garante grade e limpa área
+    # garante grade e limpa área somente se houver algo para escrever
+    if total_rows == 0:
+        # Por segurança, não limpa e não escreve vazio
+        log("❌ Inesperado: df_principal vazio após hard load. Abortando com erro.")
+        return 2
+
     min_rows = max(2 + total_rows, 2)
     ensure_grid(ws_dest, min_rows=min_rows + EXTRA_TAIL_ROWS, min_cols=100)
     end_clear = max(ws_dest.row_count, 5 + total_rows + EXTRA_TAIL_ROWS)
     rng_clear = f"A5:CS{end_clear}"
     log(f"🧽 Limpando {rng_clear}…")
-    try:
-        clear_range(ws_dest, rng_clear)
-    except Exception as e:
-        log(f"⚠️  Falha ao limpar {rng_clear}: {e}")
+    clear_range(ws_dest, rng_clear)
 
-    # Escrita em blocos (se houver algo a escrever)
-    if total_rows > 0:
-        log(f"🚚 Escrevendo {total_rows} linhas (USER_ENTERED)…")
-        try:
-            chunked_write(ws_dest, start_row=5, start_col_1b=1, values=values)  # A=1
-            log("✅ Escrita de Carteira concluída.")
-        except Exception as e:
-            log(f"⚠️  Falha na escrita da base principal: {e}")
-    else:
-        log("ℹ️  Base principal vazia — nada a escrever.")
+    # Escrita em blocos
+    log(f"🚚 Escrevendo {total_rows} linhas (USER_ENTERED)…")
+    chunked_write(ws_dest, start_row=5, start_col_1b=1, values=values)
+    log("✅ Escrita de Carteira concluída.")
 
-    # Integrações futuras: aqui você pode aplicar merge/append usando df_ciclo / df_lv.
-    if df_ciclo.empty and df_lv.empty:
-        log("ℹ️  Sem linhas adicionais de CICLO/LV para inserir (após múltiplas tentativas).")
-    else:
-        if not df_ciclo.empty:
-            log(f"ℹ️  (info) CICLO carregado com {len(df_ciclo)} linhas — integrar conforme regra desejada.")
-        if not df_lv.empty:
-            log(f"ℹ️  (info) LV CICLO carregado com {len(df_lv)} linhas — integrar conforme regra desejada.")
+    # Integrações futuras com CICLO/LV (se/quando você quiser consolidar):
+    if USAR_CICLO_COMPLEMENTAR:
+        log(f"ℹ️  CICLO carregado ({len(df_ciclo)} linhas) — integrar conforme tua regra, se aplicável.")
+    if USAR_LV_COMPLEMENTAR:
+        log(f"ℹ️  LV CICLO carregado ({len(df_lv)} linhas) — integrar conforme tua regra, se aplicável.")
 
-    log("🎉 Fim do importador (com tentativas e soft-fail).")
+    log("🎉 Fim do importador — etapa garantida (sem pular) e com exit code 0.")
     return 0
 
 if __name__ == "__main__":
+    rc = 0
     try:
-        sys.exit(main() or 0)
+        rc = int(main() or 0)
     except Exception as e:
-        log(f"⚠️  Erro não tratado: {e} — encerrando sem abortar.")
-        sys.exit(0)
+        log(f"💥 Erro fatal: {e}")
+        rc = 2
+    sys.exit(rc)
