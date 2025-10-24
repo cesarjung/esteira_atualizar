@@ -121,12 +121,12 @@ def get_ws():
     sh = gc.open_by_key(SPREADSHEET_ID)
     return sh.worksheet(BD_CONFIG_SHEET)
 
-# -------- writes compactadas (D & E) com fallback quotado --------
+# -------- writes compactadas (D & E) com fallback qualificado --------
 def _update_DE_row(ws, row: int, d_val: str, e_val: str):
     attempt = 0
     while True:
         try:
-            # caminho “normal” (gspread geralmente qualifica o título)
+            # Caminho “normal”: worksheet.update no range relativo
             return ws.update(
                 range_name=f"D{row}:E{row}",
                 values=[[d_val, e_val]],
@@ -136,7 +136,7 @@ def _update_DE_row(ws, row: int, d_val: str, e_val: str):
             attempt += 1
             code = _status_code_from_apierror(e)
 
-            # Fallback específico para 404: força range qualificado com o título da aba entre aspas
+            # Fallback específico para 404: usa values_update com o nome da aba
             if code == 404:
                 try:
                     rng = f"'{ws.title}'!D{row}:E{row}"
@@ -176,11 +176,11 @@ def set_fail(ws, row: int):
     _update_DE_row(ws, row, fmt_now(), "Falhou")
 
 # -------- leitura resiliente por Values API --------
-def _values_get_resilient(sh, a1_range: str, desc: str, max_retries: int = MAX_API_RETRIES):
+def _values_get_resilient(spreadsheet, a1_range: str, desc: str, max_retries: int = MAX_API_RETRIES):
     attempt = 0
     while True:
         try:
-            resp = sh.values_get(a1_range)  # retorna dict
+            resp = spreadsheet.values_get(a1_range)  # dict
             return resp.get("values", []) or []
         except APIError as e:
             attempt += 1
@@ -275,6 +275,7 @@ def ensure_block(ws, base_dir: Path, steps: List[Tuple[str, int]], idx_offset: i
                 continue
             attempts[row] += 1
             executed += 1
+            # nota: usa índice do bloco novamente para logs (estético)
             run_step(ws, base_dir, script, row, idx_offset + 1, idx_offset + total_planned, attempts[row])
 
         status = get_status_map(ws, [row for _, row in steps])
