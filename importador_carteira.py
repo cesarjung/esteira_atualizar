@@ -103,6 +103,37 @@ def parse_dates(series_like: pd.Series) -> pd.Series:
         s = s.where(~m, pd.to_datetime(n, unit='D', origin='1899-12-30', errors='coerce'))
     return s.dt.strftime('%d/%m/%Y').where(s.notna(), "")
 
+# 🔹 NOVO: limpeza de valores para coluna K (tira R$, pontos e força vírgula)
+def limpar_valor_k(v: Any) -> str:
+    """
+    Limpa valores monetários para a coluna K:
+    - remove 'R$' e espaços
+    - remove pontos de milhar
+    - garante vírgula como separador decimal
+    """
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if s == "":
+        return ""
+
+    # remove R$, espaços comuns e espaço não-quebrável
+    s = s.replace("R$", "").replace(" ", "").replace("\u00A0", "")
+
+    # se tiver vírgula e ponto → geralmente milhar + decimal (ex: 4.284.597,68)
+    if "," in s and "." in s:
+        s = s.replace(".", "")   # tira pontos de milhar
+        # vírgula já é o decimal
+        return s
+
+    # se só tiver ponto → assume decimal e troca por vírgula
+    if "." in s and "," not in s:
+        s = s.replace(".", ",")
+        return s
+
+    # se só tiver vírgula ou nenhum separador, deixa como está
+    return s
+
 def highlight(ws,start,count,end_col="Q"):
     if not FORCAR_DESTAQ or count<=0: return
     try:
@@ -389,7 +420,8 @@ def inserir_linhas(w_dst, rows: List[List[Any]], start_row: int) -> int:
                 last_col_idx = max(last_col_idx, j)
     endL = col_letter(last_col_idx)
     a1   = f"A{start_row}:{endL}{start_row+len(rows)-1}"
-    with_retry(w_dst.update, range_name=a1, values=rows, value_input_option='RAW')
+    # 🔹 aqui usamos USER_ENTERED para o Sheets interpretar os números (incluindo K) corretamente
+    with_retry(w_dst.update, range_name=a1, values=rows, value_input_option='USER_ENTERED')
     if FORCAR_DESTAQ:
         highlight(w_dst, start_row, len(rows), endL)
     return start_row + len(rows)
@@ -419,7 +451,8 @@ def main():
         ln[a1index('A')-1] = vid
         ln[a1index('B')-1] = valF
         ln[a1index('H')-1] = valC
-        ln[a1index('K')-1] = valL
+        # 🔹 aplicar limpeza na coluna K (valor vindo da coluna L da aba CICLO)
+        ln[a1index('K')-1] = limpar_valor_k(valL)
         ln[a1index('R')-1] = uni
         linhas.append(ln)
         exist_ids.add(vid)
