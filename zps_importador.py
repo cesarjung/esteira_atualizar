@@ -1,4 +1,4 @@
-# zps_importador.py — robusto (Drive + Sheets), com credenciais flexíveis e backoff
+# zps_importador_v2.py — robusto (Drive + Sheets), com expansão automática da grade
 import io
 import os
 import time
@@ -52,8 +52,11 @@ BASE_SLEEP  = 1.0
 TRANSIENT_CODES = {429, 500, 502, 503, 504}
 
 # ========= LOG =========
-def now_hms() -> str: return datetime.now().strftime("%H:%M:%S")
-def log(msg: str): print(f"[{now_hms()}] {msg}", flush=True)
+def now_hms() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+def log(msg: str):
+    print(f"[{now_hms()}] {msg}", flush=True)
 
 # ========= AUTH =========
 def make_creds() -> Credentials:
@@ -223,50 +226,44 @@ log("🛠️ Preparando colunas de saída…")
 col_E  = df_filtrado.iloc[:, 4]
 col_N  = df_filtrado.iloc[:, 13].astype(str)
 col_Bd = col_N.str[:9]
+
 df_final = pd.DataFrame({
-    colunas_originais[4]:  col_E,
-    "B":                    col_Bd,
+    colunas_originais[4]:  col_E,                 # coluna E original
+    "B":                    col_Bd,               # 9 primeiros caracteres da N
     colunas_originais[23]: df_filtrado.iloc[:, 23],
     colunas_originais[24]: df_filtrado.iloc[:, 24],
     colunas_originais[25]: df_filtrado.iloc[:, 25],
     colunas_originais[26]: df_filtrado.iloc[:, 26],
     colunas_originais[27]: df_filtrado.iloc[:, 27],
 })
+
 df_final["H"] = df_final["B"].astype(str).str[0]
 df_final["I"] = df_final["B"].astype(str).str[-7:]
 
-# ========= LIMPEZA + ANTI-FILTRO =========
-def get_sheet_id(spreadsheet_id: str, title: str) -> Optional[int]:
+# ========= AUX: INFO DA ABA / EXPANSÃO DE GRADE =========
+def get_sheet_grid(spreadsheet_id: str, title: str):
+    """
+    Retorna (sheet_id, rowCount, columnCount) da aba com esse título.
+    """
     info = with_retry(
         lambda: sheets.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
-            fields="sheets(properties(sheetId,title))",
+            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
         ).execute(),
-        "spreadsheets.get(sheetId)"
+        "spreadsheets.get(gridProperties)"
     )
     for sh in info.get("sheets", []):
         props = sh.get("properties", {})
         if props.get("title") == title:
-            return props.get("sheetId")
-    return None
+            gp = props.get("gridProperties", {}) or {}
+            return (
+                props.get("sheetId"),
+                gp.get("rowCount", 0),
+                gp.get("columnCount", 0),
+            )
+    return None, 0, 0
 
-def clear_basic_filter(sheet_id: Optional[int]):
-    if not sheet_id:
-        return
-    body = {"requests": [{"clearBasicFilter": {"sheetId": sheet_id}}]}
-    try:
-        with_retry(
-            lambda: sheets.spreadsheets().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID, body=body
-            ).execute(),
-            "batchUpdate(clearBasicFilter)"
-        )
-    except Exception as e:
-        log(f"⚠️  Ignorado erro ao limpar filtros: {type(e).__name__} | {e}")
-
-sheet_id = get_sheet_id(SPREADSHEET_ID, ABA_DESTINO)
-clear_basic_filter(sheet_id)
-
+# ========= LIMPEZA DA ABA =========
 log("🧽 Limpando conteúdo da aba (zps)…")
 with_retry(
     lambda: sheets.spreadsheets().values().clear(
@@ -281,7 +278,46 @@ valores = [df_final.columns.tolist()] + df_final.values.tolist()
 if not valores:
     log("⛔ Nada para enviar.")
 else:
-    # cabeçalho
+    # ====== GARANTE GRADE SUFICIENTE NA ABA ======
+    sheet_id, row_count, col_count = get_sheet_grid(SPREADSHEET_ID, ABA_DESTINO)
+
+    linhas_necessarias = len(valores)          # cabeçalho + dados
+    colunas_necessarias = len(df_final.columns)
+
+    if sheet_id and (row_count < linhas_necessarias or col_count < colunas_necessarias):
+        novo_row_count = max(row_count, linhas_necessarias + 1000)  # folga de 1000 linhas
+        novo_col_count = max(col_count, colunas_necessarias)
+
+        log(
+            f"📏 Expandindo grade da aba '{ABA_DESTINO}' "
+            f"de {row_count}×{col_count} para {novo_row_count}×{novo_col_count}…"
+        )
+
+        body = {
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {
+                                "rowCount": novo_row_count,
+                                "columnCount": novo_col_count,
+                            },
+                        },
+                        "fields": "gridProperties.rowCount,gridProperties.columnCount",
+                    }
+                }
+            ]
+        }
+
+        with_retry(
+            lambda: sheets.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID, body=body
+            ).execute(),
+            "batchUpdate(expandGrid)"
+        )
+
+    # ====== CABEÇALHO ======
     with_retry(
         lambda: sheets.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
@@ -292,6 +328,7 @@ else:
         "values.update(cabecalho)"
     )
 
+    # ====== BLOCO A BLOCO ======
     t0_up = time.time()
     i, bloco = 1, 0
     pending_ranges = []
