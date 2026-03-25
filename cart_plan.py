@@ -206,12 +206,12 @@ for idx, origem_id in enumerate(ORIGENS, 1):
 
         # M(13)->12, O(15)->14, P(16)->15, Q(17)->16, AL(38)->37, BI(61)->60
         for row in dados:
-            m  = row[12] if len(row) > 12 else ""   # UNIDADE
-            o  = row[14] if len(row) > 14 else ""   # FIM PREVISTO
-            p  = row[15] if len(row) > 15 else ""   # STATUS EXECUCAO
-            q  = row[16] if len(row) > 16 else ""   # PROJETO
-            al = row[37] if len(row) > 37 else ""   # AL
-            bi = row[60] if len(row) > 60 else ""   # DATA BI
+            m  = row[56] if len(row) > 56 else ""   # UNIDADE
+            o  = row[10] if len(row) > 10 else ""   # FIM PREVISTO
+            p  = row[11] if len(row) > 11 else ""   # STATUS EXECUCAO
+            q  = row[12] if len(row) > 12 else ""   # PROJETO
+            al = row[32] if len(row) > 32 else ""   # SUPERVISOR
+            bi = row[49] if len(row) > 49 else ""   # DATA FIM COMITÊ
 
             todos_FI.append([m, parse_data_br(o), p, q])
             todas_J.append([al])
