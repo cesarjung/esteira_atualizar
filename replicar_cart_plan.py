@@ -204,16 +204,18 @@ def escrever_tudo(ws):
     _ensure_grid(ws, min_rows=2, min_cols_letter='E')
 
     # apagão antes F:J com faixa explícita (evita “infinito”)
+    # nunca ultrapassa a grade: usa row_count (não last_row+200) p/ não estourar limite
     if APAGAR_ANTES_FJ:
-        end_clear = max(ws.row_count, last_row + 200)
-        _values_clear(ws, f"'{ws.title}'!{DST_START_COL}{DST_START_ROW}:{DST_END_COL}{end_clear}",
-                      desc='values_clear F2:J{end}')
+        end_clear = ws.row_count
+        if end_clear >= DST_START_ROW:
+            _values_clear(ws, f"'{ws.title}'!{DST_START_COL}{DST_START_ROW}:{DST_END_COL}{end_clear}",
+                          desc='values_clear F2:J{end}')
 
     # escrita única
     _safe_update(ws, rng, linhas, value_input_option="USER_ENTERED", desc=f"update {rng}")
 
-    # limpa rabo (linhas abaixo do último)
-    end_tail = max(ws.row_count, last_row + 200)
+    # limpa rabo (linhas abaixo do último) — clampeado à grade; pula se dados enchem a aba
+    end_tail = ws.row_count
     if end_tail >= last_row + 1:
         tail_rng = f"'{ws.title}'!{DST_START_COL}{last_row+1}:{DST_END_COL}{end_tail}"
         _values_clear(ws, tail_rng, desc='values_clear rabo F:J')

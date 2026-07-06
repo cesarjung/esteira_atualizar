@@ -200,15 +200,17 @@ def escrever_tudo(ws):
     _ensure_grid(ws, min_rows=max(last_row, 2), min_cols_letter='E')
 
     # 🔒 apagão antes (A2:B) — faixa explícita (evita “infinito”)
+    # nunca ultrapassa a grade: usa row_count (não last_row+200) p/ não estourar limite
     if APAGAR_ANTES_A_B:
-        end_clear = max(ws.row_count, last_row + 200)  # limpa um pouco além do necessário
-        _values_clear(ws, f"'{ws.title}'!A2:B{end_clear}", desc='values_clear A2:B{end}')
+        end_clear = ws.row_count
+        if end_clear >= START_ROW:
+            _values_clear(ws, f"'{ws.title}'!A2:B{end_clear}", desc='values_clear A2:B{end}')
 
     # escrita única
     _safe_update(ws, rng, linhas, value_input_option="USER_ENTERED", desc=f"update {rng}")
 
-    # limpa rabo (A{last_row+1}:B{end_clear})
-    end_tail = max(ws.row_count, last_row + 200)
+    # limpa rabo (A{last_row+1}:B{row_count}) — clampeado à grade; pula se dados enchem a aba
+    end_tail = ws.row_count
     if end_tail >= last_row + 1:
         tail_rng = f"'{ws.title}'!A{last_row+1}:B{end_tail}"
         _values_clear(ws, tail_rng, desc='values_clear rabo A:B')
