@@ -1,0 +1,31 @@
+name: Diag - Workbook cells
+
+on:
+  workflow_dispatch:
+
+env:
+  GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install gspread google-auth
+
+      - name: Diagnóstico dos 4 destinos
+        run: |
+          python -u diag_workbook.py \
+            1zIfub-pAVtZGSjYT1Qa7HzjAof56VExU7U5WwLE382c \
+            1NL6fGUhJyde7_ttTkWRVxg78mAOw8Z5W-LBesK_If_M \
+            10Y7VKFsn-UKgMqpM63LiUD2N9_XmfSr29CuK3mq84_c \
+            1B-d3mYf7WwiAnkUTV0419f91OzPF8rcpimgtFNfQ3Mw
