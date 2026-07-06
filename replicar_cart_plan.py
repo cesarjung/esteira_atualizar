@@ -220,6 +220,11 @@ def escrever_tudo(ws):
         tail_rng = f"'{ws.title}'!{DST_START_COL}{last_row+1}:{DST_END_COL}{end_tail}"
         _values_clear(ws, tail_rng, desc='values_clear rabo F:J')
 
+    # right-size: encolhe linhas se a grade inchou além de dados+folga (mantém colunas p/ carimbo)
+    alvo_rows = max(last_row + 200, 2)
+    if ws.row_count > alvo_rows:
+        _with_retry(ws.resize, rows=alvo_rows, cols=ws.col_count, desc="rightsize linhas (encolhe grade)")
+
 def formatar(ws):
     if not APLICAR_FORMATO_DATA_G or nlin == 0:
         return

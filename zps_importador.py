@@ -284,12 +284,20 @@ else:
     linhas_necessarias = len(valores)          # cabeçalho + dados
     colunas_necessarias = len(df_final.columns)
 
-    if sheet_id and (row_count < linhas_necessarias or col_count < colunas_necessarias):
-        novo_row_count = max(row_count, linhas_necessarias + 1000)  # folga de 1000 linhas
-        novo_col_count = max(col_count, colunas_necessarias)
+    # right-size: cresce se faltar, ENCOLHE se sobrar (evita a grade inflar sem fim
+    # e encher o teto de 10M células do workbook). Alvo = dados + folga fixa.
+    FOLGA_LINHAS = 1000
+    COL_CARIMBO  = 11  # K1 recebe o timestamp; nunca cortar abaixo disso
+    novo_row_count = linhas_necessarias + FOLGA_LINHAS
+    novo_col_count = max(colunas_necessarias, COL_CARIMBO)
 
+    precisa_crescer  = row_count < linhas_necessarias or col_count < colunas_necessarias
+    precisa_encolher = row_count > novo_row_count or col_count > novo_col_count
+
+    if sheet_id and (precisa_crescer or precisa_encolher):
+        verbo = "Expandindo" if precisa_crescer else "Reduzindo"
         log(
-            f"📏 Expandindo grade da aba '{ABA_DESTINO}' "
+            f"📏 {verbo} grade da aba '{ABA_DESTINO}' "
             f"de {row_count}×{col_count} para {novo_row_count}×{novo_col_count}…"
         )
 

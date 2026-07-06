@@ -229,6 +229,11 @@ def escrever_tudo(ws_dest, all_vals, num_colunas):
         tail_rng = f"'{ws_dest.title}'!A{nlin+1}:{last_col_letter}{end_clear}"
         values_clear(ws_dest, tail_rng, tag="values_clear rabo")
 
+    # right-size: encolhe linhas se a grade inchou além de dados+folga (mantém colunas p/ carimbo)
+    alvo_rows = nlin + EXTRA_TAIL_ROWS
+    if ws_dest.row_count > alvo_rows:
+        _with_retry(ws_dest.resize, rows=alvo_rows, cols=ws_dest.col_count, desc="rightsize linhas (encolhe grade)")
+
 def formatar_colunas(ws_dest, total_linhas, num_colunas):
     if not (APLICAR_FORMATO_DATAS or APLICAR_FORMATO_NUMEROS) or total_linhas == 0:
         return

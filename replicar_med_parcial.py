@@ -185,6 +185,10 @@ def limpar_rabo(ws, last_col_letter: str, nlin: int):
         tail = f"'{ws.title}'!A{nlin+1}:{last_col_letter}{end_clear}"
         _with_retry(ws.spreadsheet.values_clear, tail, desc=f"values_clear {tail}")
         time.sleep(PAUSE_BETWEEN_WRITES)
+    # right-size: encolhe linhas se a grade inchou além de dados+folga (mantém colunas p/ carimbo)
+    alvo_rows = nlin + EXTRA_TAIL_ROWS
+    if ws.row_count > alvo_rows:
+        _with_retry(ws.resize, rows=alvo_rows, cols=ws.col_count, desc="rightsize linhas (encolhe grade)")
 
 def escrever(ws, last_col_letter: str, all_vals: List[List[str]]):
     nlin = len(all_vals)

@@ -233,6 +233,11 @@ if total > lin_fim + 1:
     sobra = f"{DEST_START_LET}{lin_fim+1}:{DEST_END_LET}{total}"
     gs_retry(w_dst.batch_clear, [sobra], desc=f"post clear {sobra}")
 
+# right-size: encolhe linhas se a grade inchou (mantém colunas p/ carimbo Z1)
+alvo_rows = max(lin_fim + 200, 2)
+if w_dst.row_count > alvo_rows:
+    gs_retry(w_dst.resize, rows=alvo_rows, cols=w_dst.col_count, desc="rightsize linhas")
+
 if FORCAR_FORMATACAO:
     try:
         n = len(linhas)

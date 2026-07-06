@@ -228,6 +228,11 @@ def limpar_e_escrever_destino(gc: gspread.Client, planilha_id: str, cabecalho: L
         tail_rng = f"'{ws.title}'!A{last_row+1}:{a1(19, end_clear)}"
         values_clear(ws, tail_rng, tag=f'values_clear tail {tail_rng}')
 
+    # right-size: encolhe linhas se a grade inchou (mantém colunas p/ carimbo T2)
+    alvo_rows = len(dados_fmt) + 2 + EXTRA_TAIL_ROWS
+    if ws.row_count > alvo_rows:
+        with_retry(ws.resize, rows=alvo_rows, cols=ws.col_count, desc="rightsize linhas (encolhe grade)")
+
     # Timestamp final em T2
     try:
         safe_update(ws, 'T2', [[f"Replicado em: {agora()}"]], user_entered=True, tag='timestamp T2')
