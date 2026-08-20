@@ -8,12 +8,21 @@ orquestrador quanto para cada script disparado via subprocess — sem editar os
 Problema: gspread e google-api-python-client nao passam `timeout` ao requests.
 Sem timeout, uma chamada pode ficar pendurada indefinidamente.
 
-Sobre o valor: a planilha origem "Esteira CCM/BA - Geral" (1gDktQhF..., ~5,5 MB)
-e editada ao vivo no expediente. Enquanto isso, a Sheets API passa a responder
-em >180s e devolve 500/409/404 mesmo em leitura. Ou seja: os ~190s observados
-nos runs travados sao contencao da origem, nao falta de timeout. O timeout aqui
-e TETO contra pendura infinita — 180s, porque chamadas legitimas chegam a ~181s
-na 1a tentativa. Baixar para 60s aborta trabalho que ia completar.
+Sobre o valor (300s): a planilha origem "Esteira CCM/BA - Geral" (1gDktQhF...,
+~5,5 MB) e editada ao vivo no expediente. Enquanto isso a Sheets API responde
+em ~190s e devolve 500/503/409/404 mesmo em leitura. Esses 500/503 os wrappers
+`except APIError` do repo JA tratam com backoff, e o script conclui.
+
+O timeout PRECISA ficar acima desses ~190s. Com 180s a chamada era abortada
+antes da resposta do servidor e virava requests.exceptions.ReadTimeout — que
+nao e APIError e portanto escapa de todos os 37 wrappers de retry do repo,
+matando o script na hora. Medido: ciclo.py falhou 3x em 363s no run
+32396124086 (timeout 180) contra sucesso em 1042s no run 32376629883 (sem
+timeout algum). Isto e teto contra pendura infinita, nao acelerador.
+
+PENDENTE: os wrappers so pegam APIError. Enquanto isso nao mudar, qualquer
+ReadTimeout/ConnectionError continua sendo fatal sem retry — o valor alto do
+timeout so torna isso raro, nao impossivel.
 
 A alavanca real e reduzir o numero de chamadas e rodar fora do expediente.
 
@@ -24,7 +33,7 @@ parse defensivo de env e o try/except em volta de tudo.
 
 import os
 
-_DEFAULT_READ = 180.0
+_DEFAULT_READ = 300.0
 _DEFAULT_CONNECT = 15.0
 
 

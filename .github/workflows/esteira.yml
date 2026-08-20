@@ -14,11 +14,14 @@ env:
   PYTHONUNBUFFERED: "1"
   GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
   PYTHONPATH: .                  # ativa sitecustomize.py (timeout HTTP global)
-  # 180s, NAO 60s: a origem "Esteira CCM/BA - Geral" (5,5 MB, editada ao vivo)
-  # faz chamadas legitimas levarem ~72s, e a 1a tentativa costuma chegar a ~181s.
-  # Com 60s abortariamos chamadas que iam completar. O timeout aqui e teto contra
-  # pendura infinita, nao acelerador.
-  HTTP_TIMEOUT: "180"
+  # 300s, nao 180s. A origem responde em ~190s quando esta sob edicao, e
+  # devolve 500/503 — que os wrappers `except APIError` do repo JA tratam com
+  # backoff. Cortar em 180s abortava a chamada ANTES dessa resposta e virava
+  # requests.exceptions.ReadTimeout, que nenhum dos 37 wrappers pega: o script
+  # morria RC=1 sem retry. Medido no run 32396124086: ciclo.py falhou 3x em
+  # 363s (2x180s), contra sucesso em 1042s no run 32376629883 sem timeout.
+  # O teto existe para pendura infinita, nao para cortar trabalho em curso.
+  HTTP_TIMEOUT: "300"
   PIPELINE_DEADLINE_MIN: "90"    # < timeout-minutes: sai com resumo antes do kill
 
 jobs:
