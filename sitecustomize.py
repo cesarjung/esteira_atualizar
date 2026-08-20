@@ -29,9 +29,30 @@ A alavanca real e reduzir o numero de chamadas e rodar fora do expediente.
 IMPORTANTE: como este modulo roda no startup de todo interpretador, qualquer
 excecao aqui quebra TODOS os scripts. Nada neste arquivo pode levantar — daí o
 parse defensivo de env e o try/except em volta de tudo.
+
+IMPORTANTE 2: NADA aqui pode escrever em stdout. `actions/setup-python` executa
+`pip cache dir` e usa o stdout como caminho do cache; uma linha nossa ali entra
+no caminho e faz o step "Post Setup Python" falhar, derrubando o job inteiro
+mesmo com a pipeline OK (visto no run 32398491454). Diagnostico vai para stderr
+e somente quando SITECUSTOMIZE_DEBUG esta setado. O caso comum de "requests
+ausente" (o Python do pip nao tem requests) e silencioso de proposito: nao e
+erro, so significa que nao ha o que patchear naquele interpretador.
 """
 
 import os
+import sys
+
+_DEBUG = bool((os.environ.get("SITECUSTOMIZE_DEBUG") or "").strip())
+
+
+def _warn(msg):
+    """Diagnostico opt-in, sempre em stderr. Ver IMPORTANTE 2 no docstring."""
+    if not _DEBUG:
+        return
+    try:
+        print(f"[sitecustomize] {msg}", file=sys.stderr)
+    except Exception:
+        pass
 
 _DEFAULT_READ = 300.0
 _DEFAULT_CONNECT = 15.0
@@ -45,7 +66,7 @@ def _num(env_name, default):
     try:
         v = float(raw)
     except (TypeError, ValueError):
-        print(f"[sitecustomize] {env_name}={raw!r} invalido; usando {default}")
+        _warn(f"{env_name}={raw!r} invalido; usando {default}")
         return default
     return v if v > 0 else default
 
@@ -54,7 +75,7 @@ HTTP_TIMEOUT = _num("HTTP_TIMEOUT", _DEFAULT_READ)
 CONNECT_TIMEOUT = _num("HTTP_CONNECT_TIMEOUT", _DEFAULT_CONNECT)
 
 try:
-    import requests.sessions as _sessions
+    import requests.sessions as _sessions  # ausente no Python do pip: ok, sai silencioso
 
     _orig_request = _sessions.Session.request
 
@@ -70,7 +91,7 @@ try:
         _request._timeout_patched = True
         _sessions.Session.request = _request
 except Exception as e:  # nunca quebrar o startup do interpretador
-    print(f"[sitecustomize] aviso: patch de timeout nao aplicado: {e}")
+    _warn(f"patch de timeout nao aplicado: {e}")
 
 try:
     import socket
