@@ -1,0 +1,75 @@
+name: Rodar script avulso
+
+# Executa UM script do repo sob demanda, sem passar pelo orquestrador.
+# Uso: Actions > Rodar script avulso > Run workflow > escolher o script.
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Script a executar"
+        type: choice
+        required: true
+        default: zps_importador.py
+        options:
+          - zps_importador.py
+          - ciclo.py
+          - lv.py
+          - med_parcial.py
+          - operacao.py
+          - cart_plan.py
+          - bd_exec.py
+          - importador_carteira.py
+          - importador_carteira_lv.py
+          - importador_historico.py
+          - replicar_zps.py
+          - replicar_ciclo.py
+          - replicar_lv.py
+          - replicar_med_parcial.py
+          - replicar_operacao.py
+          - replicar_cart_plan.py
+          - replicar_bd_exec.py
+          - replicar_carteira.py
+env:
+  TZ: America/Sao_Paulo
+  PYTHONUNBUFFERED: "1"
+  GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      # Compartilha o grupo com a orquestração: evita dois processos escrevendo
+      # na mesma planilha ao mesmo tempo.
+      group: esteira-orquestracao
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executar ${{ inputs.script }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail   # sem isso o exit code viria do tee, nao do python
+          test -f "${{ inputs.script }}"
+          python -u "${{ inputs.script }}" 2>&1 | tee logs.txt
+
+      - name: Anexar logs
+        if: always()           # preserva o log em falha e em timeout
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-avulso-${{ github.run_id }}
+          path: logs.txt
