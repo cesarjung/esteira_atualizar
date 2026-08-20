@@ -14,11 +14,16 @@ env:
   DISABLE_FORMATTING: "1"
   PYTHONPATH: .
   HTTP_TIMEOUT: "300"   # ver comentario em esteira.yml
+  # Runs observados: 27min a 2h08. 150 min da margem sobre o pior caso real e
+  # ainda garante resumo antes do kill. Nota: este workflow compartilha o grupo
+  # de concurrency com a orquestracao, entao um historico longo atrasa o slot
+  # das 02:00 UTC (23h BR) — preferivel a rodar em paralelo e colher HTTP 409.
+  PIPELINE_DEADLINE_MIN: "150"
 
 jobs:
   historico:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 170
     concurrency:
       # Mesmo grupo dos outros workflows: o historico das 22h BR frequentemente
       # ainda esta rodando quando a orquestracao das 23h BR comeca, e ambos

@@ -7,6 +7,20 @@ import pandas as pd
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
+
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
 from gspread.utils import rowcol_to_a1
 
 # === CONFIGURAÇÕES ===
@@ -30,7 +44,7 @@ def retry(callable_, *args, **kwargs):
     for tent in range(6):  # 0..5 -> ~1s,2s,4s,8s,16s,32s
         try:
             return callable_(*args, **kwargs)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             msg = str(e)
             if any(code in msg for code in ('429', '500', '503')):
                 espera = min(60, 2 ** tent)

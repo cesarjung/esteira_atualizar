@@ -7,6 +7,20 @@ import unicodedata
 import gspread
 from gspread.exceptions import APIError
 
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
+
 # === CONFIG ===
 ID_ORIGEM       = "1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM"
 ABA_HISTORICO   = "Historico"
@@ -79,7 +93,7 @@ def _retry(delays, fn, *args, op_name=None, **kwargs):
     for i, d in enumerate(delays, start=1):
         try:
             return fn(*args, **kwargs)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             if not _is_transient(e):
                 raise
             tag = f" ({op_name})" if op_name else ""

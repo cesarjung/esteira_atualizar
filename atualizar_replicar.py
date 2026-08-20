@@ -38,6 +38,20 @@ from typing import Dict, List, Tuple, Optional
 
 import gspread
 from gspread.exceptions import APIError
+
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
 from google.oauth2.service_account import Credentials as SACreds
 
 # =======================
@@ -141,7 +155,7 @@ def _update_DE_row(ws, row: int, d_val: str, e_val: str):
                 values=[[d_val, e_val]],
                 value_input_option="USER_ENTERED",
             )
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             attempt += 1
             code = _status_code_from_apierror(e)
 
@@ -154,7 +168,7 @@ def _update_DE_row(ws, row: int, d_val: str, e_val: str):
                         params={"valueInputOption": "USER_ENTERED"},
                         body={"values": [[d_val, e_val]]},
                     )
-                except APIError as e2:
+                except RETRYABLE_EXC as e2:
                     code2 = _status_code_from_apierror(e2)
                     if attempt >= MAX_API_RETRIES or (code2 is not None and code2 not in RETRYABLE_CODES):
                         raise
@@ -203,7 +217,7 @@ def _values_get_resilient(spreadsheet, a1_range: str, desc: str, max_retries: in
         try:
             resp = spreadsheet.values_get(a1_range)  # dict
             return resp.get("values", []) or []
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             attempt += 1
             code = _status_code_from_apierror(e)
             if attempt >= max_retries or (code is not None and code not in RETRYABLE_CODES):

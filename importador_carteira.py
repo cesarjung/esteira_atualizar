@@ -12,6 +12,20 @@ from urllib3.util.retry import Retry
 
 import gspread
 from gspread.exceptions import APIError
+
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
 from gspread.utils import rowcol_to_a1, a1_to_rowcol
 from google.oauth2.service_account import Credentials as SACreds
 from google.auth.transport.requests import Request as GARequest
@@ -70,7 +84,7 @@ def with_retry(fn, *a, desc="", base=0.6, maxr=MAX_RETRIES, **k):
     while True:
         try:
             return fn(*a, **k)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             r += 1
             code = _status_code_from_apierror(e)
 

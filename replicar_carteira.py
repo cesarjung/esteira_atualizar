@@ -17,6 +17,20 @@ except Exception:
 
 import gspread
 from gspread.exceptions import APIError, WorksheetNotFound
+
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
 from google.oauth2.service_account import Credentials as SACreds
 
 try:
@@ -84,7 +98,7 @@ def with_retry(fn, *args, desc="", **kwargs):
     for tent in range(1, MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             code = _status_code(e)
             if code not in TRANSIENT or tent >= MAX_RETRIES:
                 print(f"❌ {desc or fn.__name__} falhou: {e}")
@@ -251,7 +265,7 @@ def tentar_destino_ate_dar_certo(gc: gspread.Client, planilha_id: str, cabecalho
                 time.sleep(atraso)
             limpar_e_escrever_destino(gc, planilha_id, cabecalho, dados)
             return
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             print(f"⚠️  Destino {planilha_id} – APIError: {e}")
         except Exception as e:
             print(f"⚠️  Destino {planilha_id} – erro: {e}")

@@ -1,6 +1,7 @@
 # run_historico_com_replicas.py
 # Executa o importador do Histórico e, se OK, executa o replicador do Histórico.
 
+import os
 import subprocess
 import sys
 import time
@@ -17,6 +18,16 @@ MAX_ATTEMPTS = 3
 
 # Backoff base (segundos) — cresce exponencialmente a cada tentativa, com jitter ±20%
 BACKOFF_BASE_SECONDS = 5
+
+# Deadline interno: encerra com resumo antes do timeout-minutes do runner matar o
+# job. Sem isto, uma degradacao da planilha origem levava o run ate o teto e o
+# job morria sem dizer o que ficou de fora.
+DEADLINE_MIN = float(os.getenv("PIPELINE_DEADLINE_MIN", "0") or 0)
+_T0 = time.monotonic()
+
+
+def deadline_exceeded() -> bool:
+    return DEADLINE_MIN > 0 and (time.monotonic() - _T0) > DEADLINE_MIN * 60.0
 
 # Scripts em ORDEM
 SCRIPT_IMPORTADOR = "importador_historico.py"
@@ -58,6 +69,10 @@ def run_script_once(script_path: Path, idx: int, total: int) -> int:
 def run_with_retries(script_path: Path, idx: int, total: int) -> int:
     rc = 1
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if attempt > 1 and deadline_exceeded():
+            print(f"⏰ Deadline de {DEADLINE_MIN:.0f} min atingido — sem mais tentativas "
+                  f"para {script_path.name}", flush=True)
+            return rc
         if attempt > 1:
             print(f"🔁 Tentativa {attempt}/{MAX_ATTEMPTS} para {script_path.name}", flush=True)
         rc = run_script_once(script_path, idx, total)
@@ -82,6 +97,9 @@ def main():
 
     banner("HISTÓRICO → RÉPLICAS (orquestrador)")
 
+    if DEADLINE_MIN > 0:
+        print(f"⏱️  Deadline interno: {DEADLINE_MIN:.0f} min (PIPELINE_DEADLINE_MIN)", flush=True)
+
     overall_start = time.perf_counter()
 
     # 1) Importador
@@ -92,6 +110,14 @@ def main():
         sys.exit(1)
 
     # 2) Replicador (só roda se importador OK ou se STOP_ON_FAILURE=False)
+    if deadline_exceeded():
+        total_time = time.perf_counter() - overall_start
+        banner(f"FIM (INTERROMPIDO) – Deadline de {DEADLINE_MIN:.0f} min atingido "
+               f"apos o importador – Tempo total: {total_time:.1f}s")
+        print(f"Resumo: importador RC={rc_import}; {SCRIPT_REPLICADOR} NAO executado "
+              f"por deadline. ❌", flush=True)
+        sys.exit(1)
+
     rc_repl = run_with_retries(base_dir / SCRIPT_REPLICADOR, idx=2, total=2)
 
     total_time = time.perf_counter() - overall_start

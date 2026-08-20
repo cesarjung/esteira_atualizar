@@ -11,6 +11,20 @@ from datetime import datetime
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
+
 # ====== FLAG: formatação opcional (desligada por padrão) ======
 FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
 
@@ -71,7 +85,7 @@ def with_retry(fn, *args, max_retries=MAX_RETRIES, base_sleep=BASE_SLEEP, desc="
     while True:
         try:
             return fn(*args, **kwargs)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             tent += 1
             code = _status_from_apierror(e)
             if tent >= max_retries or (code is not None and code not in RETRYABLE):
@@ -268,7 +282,7 @@ if FORCAR_FORMATACAO and n_rows > 1:
         }
         with_retry(ws_dst.spreadsheet.batch_update, reqs, desc="batch_update formato")
         log("✅ Formatação aplicada.")
-    except APIError as e:
+    except RETRYABLE_EXC as e:
         log(f"⚠️  Falha na formatação opcional (seguindo mesmo assim): {e}")
 
 # TIMESTAMP FINAL

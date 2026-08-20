@@ -20,6 +20,20 @@ import gspread
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
+
 # ========= CONFIG =========
 ID_ORIGEM      = '1gDktQhF0WIjfAX76J2yxQqEeeBsSfMUPGs5svbf9xGM'
 ABA            = 'BD_EXEC'
@@ -86,7 +100,7 @@ def _with_retry(fn, *args, desc=None, **kwargs):
     for tent in range(1, MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             code = _status_code(e)
             if code not in TRANSIENT_CODES or tent >= MAX_RETRIES:
                 print(f"❌ {desc or fn.__name__} falhou: {e}")
@@ -245,7 +259,7 @@ def formatar(ws):
     }
     try:
         _with_retry(ws.spreadsheet.batch_update, {"requests": [req]}, desc='format G as DATE')
-    except APIError as e:
+    except RETRYABLE_EXC as e:
         print(f"⚠️  Formatação ignorada (API instável): {e}")
 
 def carimbar(ws):
@@ -255,7 +269,7 @@ def carimbar(ws):
     _ensure_grid(ws, min_rows=2, min_cols_letter='E')
     try:
         _safe_update(ws, CARIMBAR_CEL, [[f'Atualizado em: {ts}']], value_input_option='RAW', desc='carimbar E1')
-    except APIError as e:
+    except RETRYABLE_EXC as e:
         print(f"⚠️  Carimbo ignorado: {e}")
 
 def replicar_para(dest_id: str):
@@ -272,7 +286,7 @@ def replicar_para(dest_id: str):
     try:
         _ensure_grid(ws, min_rows=2, min_cols_letter='E')
         _safe_update(ws, CARIMBAR_CEL, [['Atualizando...']], value_input_option='RAW', desc='status E1')
-    except APIError as e:
+    except RETRYABLE_EXC as e:
         print(f"⚠️  Não foi possível marcar status em E1: {e}")
 
     escrever_tudo(ws)

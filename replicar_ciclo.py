@@ -10,6 +10,20 @@ from typing import List, Tuple
 
 import gspread
 from gspread.exceptions import APIError, WorksheetNotFound
+
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
 from google.oauth2.service_account import Credentials as SACreds
 
 # ========= CONFIG =========
@@ -77,7 +91,7 @@ def _with_retry(fn, *args, desc=None, **kwargs):
     for tent in range(1, MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             code = _status_code(e)
             if code not in TRANSIENT_CODES or tent >= MAX_RETRIES:
                 print(f"❌ {desc or fn.__name__} falhou: {e}")
@@ -223,7 +237,7 @@ def formatar(ws, nlin: int):
     if reqs:
         try:
             _with_retry(ws.spreadsheet.batch_update, {"requests": reqs}, desc="batch_update format")
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             print(f"⚠️  Formatação ignorada (API instável): {e}")
 
 def carimbar(ws):

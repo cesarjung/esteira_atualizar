@@ -5,6 +5,20 @@ from typing import Optional
 
 import gspread
 from gspread.exceptions import APIError
+
+# Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
+# sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
+# que NAO e APIError e escapava de todos os wrappers deste repo — o script
+# morria sem nenhuma retentativa. Os extratores de status devolvem None para
+# essas excecoes, e a condicao "code is not None and code not in RETRYABLE"
+# dos wrappers entao permite o retry normalmente.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnError
+    from requests.exceptions import Timeout as _ReqTimeout
+    RETRYABLE_EXC = (APIError, _ReqTimeout, _ReqConnError)
+except Exception:  # requests ausente: mantem o comportamento antigo
+    RETRYABLE_EXC = (APIError,)
+
 from google.oauth2.service_account import Credentials as SACreds
 
 __VERSION__ = "ciclo.py corrigido K/L/P numeros + G/M/O datas"
@@ -66,7 +80,7 @@ def gs_retry(fn, *args, desc="", max_tries=MAX_RETRIES, base=BASE_SLEEP, **kw):
     while True:
         try:
             return fn(*args, **kw)
-        except APIError as e:
+        except RETRYABLE_EXC as e:
             tent += 1
             code = _status_from_apierror(e)
 
@@ -379,7 +393,7 @@ if FORCAR_FORMATACAO:
 
             gs_retry(w_dst.spreadsheet.batch_update, reqs, desc="format opcional")
 
-    except APIError as e:
+    except RETRYABLE_EXC as e:
         print(f"[AVISO] Formatação opcional falhou (segue): {e}", flush=True)
 
 gs_retry(
