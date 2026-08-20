@@ -41,7 +41,7 @@ APLICAR_FORMATO_DATA_B  = False  # se True, força B como DATE dd/mm/yyyy
 CARIMBAR                = True
 
 # ========= TUNING (retries/backoff/pausas) =========
-TRANSIENT_CODES = {429, 500, 502, 503, 504}
+TRANSIENT_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
 MAX_RETRIES = 6
 BASE_SLEEP  = 1.0  # s — exponencial + jitter
 PAUSE_BETWEEN_WRITES = 0.12  # s

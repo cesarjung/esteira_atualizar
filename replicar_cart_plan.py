@@ -42,7 +42,7 @@ APLICAR_FORMATO_DATA_G = False  # se True, força G como DATE dd/MM/yyyy
 CARIMBAR               = True
 
 # ========= TUNING =========
-TRANSIENT_CODES = {429, 500, 502, 503, 504}
+TRANSIENT_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
 MAX_RETRIES     = 6
 BASE_SLEEP      = 1.0
 PAUSE_BETWEEN_WRITES = 0.12

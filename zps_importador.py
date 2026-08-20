@@ -49,7 +49,7 @@ BLOCK_ROWS  = 2000           # linhas por bloco de envio
 BATCH_GROUP = 8              # quantos ranges acumulamos antes de dar flush
 MAX_RETRIES = 6
 BASE_SLEEP  = 1.0
-TRANSIENT_CODES = {429, 500, 502, 503, 504}
+TRANSIENT_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
 
 # ========= LOG =========
 def now_hms() -> str:

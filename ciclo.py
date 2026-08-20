@@ -38,7 +38,7 @@ SCOPES = [
 
 MAX_RETRIES = 6
 BASE_SLEEP = 1.0
-RETRYABLE_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
 
 
 def _num_to_col(n: int) -> str:

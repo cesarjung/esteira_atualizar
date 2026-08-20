@@ -25,7 +25,7 @@ CAM_CRED     = 'credenciais.json'  # fallback
 CHUNK_ROWS      = int(os.environ.get("CHUNK_ROWS", "2000"))
 MAX_RETRIES     = 6
 BASE_SLEEP      = 1.0
-TRANSIENT_CODES = {429, 500, 502, 503, 504}
+TRANSIENT_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
 
 # ================== LOG ====================
 def now(): return datetime.now().strftime('%d/%m/%Y %H:%M:%S')

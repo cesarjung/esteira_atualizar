@@ -17,7 +17,7 @@ FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"
 CHUNK_ROWS        = int(os.environ.get("CHUNK_ROWS", "3000"))
 MAX_RETRIES       = 6
 BASE_SLEEP        = 1.0
-TRANSIENT_CODES   = {429, 500, 502, 503, 504}
+TRANSIENT_CODES   = {404, 408, 409, 429, 500, 502, 503, 504}
 
 # ========= FUSO (opcional; não altera a lógica) =========
 os.environ.setdefault("TZ", "America/Sao_Paulo")

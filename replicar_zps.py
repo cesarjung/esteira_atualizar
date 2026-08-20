@@ -39,7 +39,7 @@ COLS_DATE_IDX = {0, 13}
 # TUNING / RETRIES
 # =========================
 SCOPES               = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-TRANSIENT_CODES      = {429, 500, 502, 503, 504}
+TRANSIENT_CODES      = {404, 408, 409, 429, 500, 502, 503, 504}
 MAX_RETRIES          = 6
 BASE_SLEEP           = 1.0
 PAUSE_BETWEEN_WRITES = 0.10

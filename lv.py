@@ -26,7 +26,7 @@ CAM_CRED      = 'credenciais.json'  # fallback local
 CHUNK_ROWS    = int(os.environ.get("CHUNK_ROWS", "2000"))
 MAX_RETRIES   = 6
 BASE_SLEEP    = 1.1
-RETRYABLE     = {429, 500, 502, 503, 504}
+RETRYABLE     = {404, 408, 409, 429, 500, 502, 503, 504}
 
 # ====== LOG ======
 def now_str():

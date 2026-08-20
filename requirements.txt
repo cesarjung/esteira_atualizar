@@ -1,10 +1,12 @@
-google-api-python-client
-google-auth
-gspread
-gspread-formatting
-gspread-dataframe
-oauth2client
-pandas
-openpyxl
-requests
-python-dateutil
+# Pinado por faixa: sem limite superior, um major novo do gspread (ex.: 6.x -> 7.x)
+# muda assinaturas de ws.update()/values_* e derruba a pipeline sem nenhum commit.
+google-api-python-client>=2.120,<3
+google-auth>=2.28,<3
+gspread>=6.1,<7
+gspread-formatting>=1.2,<2
+gspread-dataframe>=4.0,<5
+oauth2client==4.1.3        # legado: usado so por agparse.py
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+requests>=2.31,<3
+python-dateutil>=2.9,<3

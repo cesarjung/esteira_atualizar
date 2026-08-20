@@ -52,11 +52,20 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-MAX_ATTEMPTS_PER_STEP = 3
+MAX_ATTEMPTS_PER_STEP = int(os.getenv("MAX_ATTEMPTS_PER_STEP", "3"))
 BATCH_GET_MAX_PER_CALL = 40
 MAX_API_RETRIES = 6
 BASE_SLEEP = 1.1
-RETRYABLE_CODES = {429, 500, 502, 503, 504}
+# 404/409 do Sheets sao transitorios sob degradacao (o mesmo range respondeu
+# antes no mesmo run). Sem eles em RETRYABLE_CODES a chamada falhava de primeira.
+RETRYABLE_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
+
+# Deadline interno: encerra com resumo antes do timeout-minutes do runner matar o job.
+DEADLINE_MIN = float(os.getenv("PIPELINE_DEADLINE_MIN", "0") or 0)
+_T0 = time.monotonic()
+
+def deadline_exceeded() -> bool:
+    return DEADLINE_MIN > 0 and (time.monotonic() - _T0) > DEADLINE_MIN * 60.0
 
 BLOCK1 = [
     ("ciclo.py",        2),
@@ -163,17 +172,29 @@ def _update_DE_row(ws, row: int, d_val: str, e_val: str):
                 print(f"[update_DE] ⚠️  {e} — retry {attempt}/{MAX_API_RETRIES-1}", flush=True)
                 _sleep_backoff(attempt)
 
+def _safe_update_DE(ws, row: int, d_val: str, e_val: str):
+    """Escrita em BD_Config nunca deve derrubar o orquestrador.
+
+    _STATUS_CACHE e a fonte de verdade do controle de fluxo; a planilha e so o
+    espelho visivel. Antes, um 404 transitorio em set_fail() propagava e matava
+    o processo no meio do BLOCO 1.
+    """
+    try:
+        _update_DE_row(ws, row, d_val, e_val)
+    except Exception as e:
+        print(f"\u26a0\ufe0f  BD_Config!D{row}:E{row} nao atualizado ({e_val}): {e}", flush=True)
+
 def set_start(ws, row: int):
     _STATUS_CACHE[row] = "Atualizando"
-    _update_DE_row(ws, row, "Atualizando", "")
+    _safe_update_DE(ws, row, "Atualizando", "")
 
 def set_ok(ws, row: int):
     _STATUS_CACHE[row] = "OK"
-    _update_DE_row(ws, row, fmt_now(), "OK")
+    _safe_update_DE(ws, row, fmt_now(), "OK")
 
 def set_fail(ws, row: int):
     _STATUS_CACHE[row] = "Falhou"
-    _update_DE_row(ws, row, fmt_now(), "Falhou")
+    _safe_update_DE(ws, row, fmt_now(), "Falhou")
 
 # -------- leitura resiliente por Values API --------
 def _values_get_resilient(spreadsheet, a1_range: str, desc: str, max_retries: int = MAX_API_RETRIES):
@@ -267,22 +288,32 @@ def ensure_block(ws, base_dir: Path, steps: List[Tuple[str, int]], idx_offset: i
         if not pending:
             break
 
+        # BUG ANTIGO (loop infinito): a parada olhava attempts de TODOS os steps.
+        # Um step que ficou OK na 1a tentativa mantinha
+        # all(attempts >= MAX_ATTEMPTS_PER_STEP) em False, entao o while girava
+        # para sempre quando o step pendente ja tinha esgotado as tentativas.
+        # get_status_map servia do cache => sem chamada de API, so 0.6s de sleep
+        # e prints => job pendurado ate o timeout-minutes do runner.
+        retryable = [(sc, r) for sc, r in pending if attempts[r] < MAX_ATTEMPTS_PER_STEP]
+        if not retryable:
+            for sc, r in pending:
+                print(f"⚠️  Máximo de tentativas atingido para {sc} (linha E{r} ainda != OK).", flush=True)
+            break
+
+        if deadline_exceeded():
+            print(f"⏰ Deadline de {DEADLINE_MIN:.0f} min atingido — abortando retentativas do bloco.", flush=True)
+            break
+
         time.sleep(0.6)
 
-        for script, row in pending:
-            if attempts[row] >= MAX_ATTEMPTS_PER_STEP:
-                print(f"⚠️  Máximo de tentativas atingido para {script} (linha E{row} ainda != OK).", flush=True)
-                continue
+        for script, row in retryable:
+            if deadline_exceeded():
+                print(f"⏰ Deadline atingido — {script} nao sera retentado.", flush=True)
+                break
             attempts[row] += 1
             executed += 1
             # nota: usa índice do bloco novamente para logs (estético)
             run_step(ws, base_dir, script, row, idx_offset + 1, idx_offset + total_planned, attempts[row])
-
-        status = get_status_map(ws, [row for _, row in steps])
-        if all((status.get(r, "").strip().upper() == "OK") for _, r in steps):
-            break
-        if all(attempts[r] >= MAX_ATTEMPTS_PER_STEP for _, r in steps):
-            break
 
     return executed
 
@@ -314,7 +345,11 @@ def run_script_once(script_path: Path, idx: int, total: int) -> int:
         return 1
 
 def run_script_with_retries(script_path: Path, idx: int, total: int) -> int:
+    rc = 1
     for attempt in range(1, MAX_ATTEMPTS_PER_SCRIPT + 1):
+        if attempt > 1 and deadline_exceeded():
+            print(f"⏰ Deadline atingido — sem mais tentativas para {script_path.name}", flush=True)
+            return rc
         if attempt > 1:
             print(f"🔁 Tentativa {attempt}/{MAX_ATTEMPTS_PER_SCRIPT} para {script_path.name}", flush=True)
         rc = run_script_once(script_path, idx, total)
@@ -345,6 +380,12 @@ def run_replicas(base_dir: Path) -> bool:
     failures = []
     overall_start = time.perf_counter()
     for i, script in enumerate(run_list, start=1):
+        if deadline_exceeded():
+            restantes = run_list[i - 1:]
+            print(f"⏰ Deadline de {DEADLINE_MIN:.0f} min atingido — réplicas não executadas: "
+                  f"{', '.join(restantes)}", flush=True)
+            failures.extend(restantes)
+            break
         rc = run_script_with_retries(base_dir / script, i, total)
         if rc != 0:
             failures.append(script)
@@ -370,6 +411,8 @@ def main():
     base_dir = Path(__file__).parent.resolve()
     ws = get_ws()
 
+    if DEADLINE_MIN > 0:
+        print(f"⏱️  Deadline interno: {DEADLINE_MIN:.0f} min (PIPELINE_DEADLINE_MIN)", flush=True)
     banner("PIPELINE – Atualização com controle de status na aba BD_Config")
     overall_start = time.perf_counter()
 
@@ -378,7 +421,8 @@ def main():
     _ = ensure_block(ws, base_dir, BLOCK1, idx_offset=0)
     status_b1 = get_status_map(ws, [row for _, row in BLOCK1])
     if not all((status_b1.get(r, "").strip().upper() == "OK") for _, r in BLOCK1):
-        print("❌ Nem todos os passos do BLOCO 1 ficaram OK. Interrompendo.", flush=True)
+        ruins = [sc for sc, r in BLOCK1 if status_b1.get(r, "").strip().upper() != "OK"]
+        print(f"❌ BLOCO 1 incompleto — passos não-OK: {', '.join(ruins)}. Interrompendo.", flush=True)
         total_time = time.perf_counter() - overall_start
         banner(f"FIM (INTERROMPIDO) – Tempo total: {total_time:.1f}s")
         sys.exit(1)
@@ -388,13 +432,14 @@ def main():
     _ = ensure_block(ws, base_dir, BLOCK2, idx_offset=len(BLOCK1))
     status_b2 = get_status_map(ws, [row for _, row in BLOCK2])
     if not all((status_b2.get(r, "").strip().upper() == "OK") for _, r in BLOCK2):
-        print("❌ Nem todos os passos do BLOCO 2 ficaram OK. Interrompendo.", flush=True)
+        ruins = [sc for sc, r in BLOCK2 if status_b2.get(r, "").strip().upper() != "OK"]
+        print(f"❌ BLOCO 2 incompleto — passos não-OK: {', '.join(ruins)}. Interrompendo.", flush=True)
         total_time = time.perf_counter() - overall_start
         banner(f"FIM (INTERROMPIDO) – Tempo total: {total_time:.1f}s")
         sys.exit(1)
 
     # Timestamp padrão do pipeline após atualizações
-    _update_DE_row(ws, 1, fmt_now(), "OK (BLOCOS 1+2)")
+    _safe_update_DE(ws, 1, fmt_now(), "OK (BLOCOS 1+2)")
     print("✅ Atualizações OK. Timestamp gravado em BD_Config!D1:E1.", flush=True)
 
     # RÉPLICAS

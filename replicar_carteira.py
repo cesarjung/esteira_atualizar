@@ -47,7 +47,7 @@ PAUSE_BETWEEN_WRITES        = 0.12    # pequenas pausas aliviam write/min
 COLS_MIN                    = 20      # garante até T (A..T) p/ carimbo T2
 EXTRA_TAIL_ROWS             = 200     # limpeza do “rabo” além do fim
 
-TRANSIENT = {429, 500, 502, 503, 504}
+TRANSIENT = {404, 408, 409, 429, 500, 502, 503, 504}
 
 # ========= CREDENCIAIS FLEXÍVEIS =========
 def make_creds():

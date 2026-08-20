@@ -42,7 +42,7 @@ CARIMBAR_CEL            = 'Z1'     # se não existir, usa última coluna existen
 HARD_CLEAR_BEFORE_WRITE = False    # limpar A:Y antes de escrever (1 chamada extra)
 
 # Retries / tuning
-TRANSIENT_CODES         = {429, 500, 502, 503, 504}
+TRANSIENT_CODES         = {404, 408, 409, 429, 500, 502, 503, 504}
 MAX_RETRIES             = 6
 BASE_SLEEP              = 1.0
 PAUSE_BETWEEN_DESTS     = 0.6

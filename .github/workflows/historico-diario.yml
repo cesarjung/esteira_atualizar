@@ -12,6 +12,8 @@ env:
   GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
   # Opcional: desligar formatação nos scripts que suportam essa flag
   DISABLE_FORMATTING: "1"
+  PYTHONPATH: .
+  HTTP_TIMEOUT: "60"
 
 jobs:
   historico:
@@ -37,10 +39,13 @@ jobs:
           pip install -r requirements.txt
 
       - name: Executar pipeline de histórico (22h BRT)
+        shell: bash
         run: |
-          python -u historico_com_replicas.py | tee logs_historico.txt
+          set -Eeuo pipefail
+          python -u historico_com_replicas.py 2>&1 | tee logs_historico.txt
 
       - name: Anexar logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-historico-${{ github.run_id }}

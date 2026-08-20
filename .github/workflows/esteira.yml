@@ -10,6 +10,9 @@ env:
   TZ: America/Sao_Paulo
   PYTHONUNBUFFERED: "1"
   GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+  PYTHONPATH: .                  # ativa sitecustomize.py (timeout HTTP global)
+  HTTP_TIMEOUT: "60"             # segundos por chamada ao Google
+  PIPELINE_DEADLINE_MIN: "100"   # < timeout-minutes: sai com resumo antes do kill
 
 jobs:
   pipeline:
@@ -36,10 +39,13 @@ jobs:
 
       # Seu script cria credenciais.json a partir do env GOOGLE_CREDENTIALS
       - name: Executar pipeline (atualizar_replicar.py)
+        shell: bash                    # bash explicito => -o pipefail ativo
         run: |
-          python -u atualizar_replicar.py | tee logs.txt
+          set -Eeuo pipefail
+          python -u atualizar_replicar.py 2>&1 | tee logs.txt
 
       - name: Anexar logs
+        if: always()                   # preserva log em falha/timeout
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ github.run_id }}

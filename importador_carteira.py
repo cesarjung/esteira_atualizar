@@ -29,7 +29,7 @@ DATE_LETTERS = os.getenv('DATE_LETTERS', 'CN,CQ,CR,CS,BQ,CE').split(',')
 
 CHUNK_ROWS_WRITE = int(os.getenv('CHUNK_ROWS_WRITE', '2000'))
 MAX_RETRIES      = int(os.getenv('MAX_RETRIES', '5'))
-RETRYABLE_CODES  = {429, 500, 502, 503, 504}
+RETRYABLE_CODES  = {404, 408, 409, 429, 500, 502, 503, 504}
 FORCAR_DESTAQ    = os.getenv('FORCAR_DESTAQ', 'false').lower() in ('1', 'true', 'yes', 'y')
 
 BATCH_ROWS_PER_RANGE  = int(os.getenv('BATCH_ROWS_PER_RANGE', '120'))

@@ -14,7 +14,7 @@ FORCAR_FORMATACAO = os.environ.get("FORCAR_FORMATACAO", "0") == "1"  # aplica fo
 CHUNK_ROWS        = int(os.environ.get("CHUNK_ROWS", "5000"))        # linhas por bloco no upload
 MAX_RETRIES       = 6
 BASE_SLEEP        = 1.0
-TRANSIENT_CODES   = {429, 500, 502, 503, 504}
+TRANSIENT_CODES   = {404, 408, 409, 429, 500, 502, 503, 504}
 
 # ================== CONFIG ==================
 URL_ORIGEM          = 'https://docs.google.com/spreadsheets/d/189JPWONK4hSpziocviwSQOtj59rWl9tbhkVvrxb6Lds'
