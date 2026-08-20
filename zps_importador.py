@@ -294,7 +294,9 @@ else:
     precisa_crescer  = row_count < linhas_necessarias or col_count < colunas_necessarias
     precisa_encolher = row_count > novo_row_count or col_count > novo_col_count
 
-    if sheet_id and (precisa_crescer or precisa_encolher):
+    # sheetId 0 e valido (1a aba do workbook) e falsy em Python: com `if
+    # sheet_id` o resize era pulado silenciosamente nesse caso.
+    if sheet_id is not None and (precisa_crescer or precisa_encolher):
         verbo = "Expandindo" if precisa_crescer else "Reduzindo"
         log(
             f"📏 {verbo} grade da aba '{ABA_DESTINO}' "

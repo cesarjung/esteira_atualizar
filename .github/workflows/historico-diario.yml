@@ -13,7 +13,7 @@ env:
   # Opcional: desligar formatação nos scripts que suportam essa flag
   DISABLE_FORMATTING: "1"
   PYTHONPATH: .
-  HTTP_TIMEOUT: "60"
+  HTTP_TIMEOUT: "180"   # ver comentario em esteira.yml
 
 jobs:
   historico:

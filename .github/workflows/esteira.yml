@@ -11,13 +11,17 @@ env:
   PYTHONUNBUFFERED: "1"
   GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
   PYTHONPATH: .                  # ativa sitecustomize.py (timeout HTTP global)
-  HTTP_TIMEOUT: "60"             # segundos por chamada ao Google
-  PIPELINE_DEADLINE_MIN: "100"   # < timeout-minutes: sai com resumo antes do kill
+  # 180s, NAO 60s: a origem "Esteira CCM/BA - Geral" (5,5 MB, editada ao vivo)
+  # faz chamadas legitimas levarem ~72s, e a 1a tentativa costuma chegar a ~181s.
+  # Com 60s abortariamos chamadas que iam completar. O timeout aqui e teto contra
+  # pendura infinita, nao acelerador.
+  HTTP_TIMEOUT: "180"
+  PIPELINE_DEADLINE_MIN: "90"    # < timeout-minutes: sai com resumo antes do kill
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 110
     concurrency:
       group: esteira-orquestracao
       cancel-in-progress: false
