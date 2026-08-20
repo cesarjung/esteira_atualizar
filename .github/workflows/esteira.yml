@@ -3,8 +3,11 @@ name: Esteira - Orquestração
 on:
   workflow_dispatch:            # botão "Run workflow"
   schedule:
-    # Horários em UTC equivalentes a 06:00, 10:00, 12:00, 15:00, 19:00, 21:00 em America/Sao_Paulo (UTC-3)
-    - cron: "0 0,9,13,15,18,22 * * *"
+    # UTC = 05, 07, 11, 17, 19 e 23h em America/Sao_Paulo (UTC-3).
+    # Antes: 06/10/12/15/19/21h BR — tres slots caiam no pico de edicao da
+    # planilha origem "Esteira CCM/BA - Geral", quando a Sheets API passa a
+    # responder >180s com 500/409 e as tentativas se esgotam sem terminar.
+    - cron: "0 8,10,14,20,22,2 * * *"
 
 env:
   TZ: America/Sao_Paulo
@@ -23,7 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 110
     concurrency:
-      group: esteira-orquestracao
+      # Grupo unico para TODOS os workflows deste repo: os tres escrevem na
+      # mesma planilha, e dois processos simultaneos geram HTTP 409
+      # "operation was aborted". Serializar e mais lento, mas termina.
+      group: esteira-planilha
       cancel-in-progress: false
 
     steps:

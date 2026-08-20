@@ -20,7 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     concurrency:
-      group: historico-diario
+      # Mesmo grupo dos outros workflows: o historico das 22h BR frequentemente
+      # ainda esta rodando quando a orquestracao das 23h BR comeca, e ambos
+      # escrevem na mesma planilha (colisao -> HTTP 409).
+      group: esteira-planilha
       cancel-in-progress: false
 
     steps:

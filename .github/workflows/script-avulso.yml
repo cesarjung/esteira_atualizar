@@ -40,9 +40,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      # Compartilha o grupo com a orquestração: evita dois processos escrevendo
-      # na mesma planilha ao mesmo tempo.
-      group: esteira-orquestracao
+      # Compartilha o grupo com os demais workflows: evita dois processos
+      # escrevendo na mesma planilha ao mesmo tempo.
+      group: esteira-planilha
       cancel-in-progress: false
 
     steps:
