@@ -68,6 +68,14 @@ DESTINO_BACKOFF_BASE_S = 5  # 5,10,20,40,80
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 CREDENTIALS_PATH_FALLBACK = "credenciais.json"
 
+
+# A aba BD_EXEC tem DOIS escritores: replicar_bd_exec.py (A:B, ~17.9k linhas) e
+# replicar_cart_plan.py (F:J, ~12.4k linhas). Encolher a grade APAGA as linhas
+# excedentes, entao quem escreve menos truncava os dados do outro em todo run —
+# ~5.2k linhas de A:B perdidas nos 4 destinos, em silencio. Manter False.
+# Custo de nao encolher: ~197k celulas por aba, irrelevante perto do teto de 10M.
+ENCOLHER_GRADE = False
+
 def make_creds():
     env_json = os.environ.get("GOOGLE_CREDENTIALS")
     if env_json:
@@ -230,9 +238,12 @@ def escrever_tudo(ws):
         _values_clear(ws, tail_rng, desc='values_clear rabo A:B')
 
     # right-size: encolhe linhas se a grade inchou além de dados+folga (mantém colunas p/ carimbo E1)
-    alvo_rows = max(last_row + 200, 2)
-    if ws.row_count > alvo_rows:
-        _with_retry(ws.resize, rows=alvo_rows, cols=ws.col_count, desc="rightsize linhas (encolhe grade)")
+    # right-size DESLIGADO nesta aba — ver ENCOLHER_GRADE.
+    if ENCOLHER_GRADE:
+        alvo_rows = max(last_row + 200, 2)
+        if ws.row_count > alvo_rows:
+            _with_retry(ws.resize, rows=alvo_rows, cols=ws.col_count,
+                        desc="rightsize linhas (encolhe grade)")
 
 def formatar(ws):
     if not APLICAR_FORMATO_DATA_B or nlin == 0:
