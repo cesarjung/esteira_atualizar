@@ -84,9 +84,30 @@ def make_creds():
 gc = gspread.authorize(make_creds())
 
 # === UTILS ===
+# Excecoes de rede sao transitorias por natureza: nao trazem status HTTP nenhum,
+# entao o match de string abaixo nunca as reconheceria. Testar por tipo.
+try:
+    from requests.exceptions import ConnectionError as _NetConnError
+    from requests.exceptions import Timeout as _NetTimeout
+    _NET_EXC = (_NetTimeout, _NetConnError, TimeoutError, OSError)
+except Exception:
+    _NET_EXC = (TimeoutError, OSError)
+
+_TOKENS_TRANSIENT = (
+    '[404]', '[408]', '[409]', '[429]', '[500]', '[502]', '[503]', '[504]',
+    'backendError', 'Internal error', 'service is currently unavailable',
+    'rateLimitExceeded', 'operation was aborted',
+)
+
+
 def _is_transient(e: Exception) -> bool:
+    # Ordem importa: um ConnectionError('Connection aborted.', TimeoutError(...))
+    # nao casa com nenhum token, e era exatamente o que matava o script sem
+    # retry (run 32439661716).
+    if isinstance(e, _NET_EXC):
+        return True
     s = str(e)
-    return any(t in s for t in ('[500]', '[503]', 'backendError', 'Internal error', 'service is currently unavailable', 'rateLimitExceeded'))
+    return any(t in s for t in _TOKENS_TRANSIENT)
 
 def _retry(delays, fn, *args, op_name=None, **kwargs):
     total = len(delays)
