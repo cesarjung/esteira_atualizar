@@ -75,6 +75,9 @@ BASE_SLEEP = 1.1
 # 404/409 do Sheets sao transitorios sob degradacao (o mesmo range respondeu
 # antes no mesmo run). Sem eles em RETRYABLE_CODES a chamada falhava de primeira.
 RETRYABLE_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
+# batchGet das replicas (prefetch_origem): run 38737245608 so passou na 6a
+# tentativa (5x 503 de ~186s cada). Mais folga aqui, ainda limitada pelo deadline.
+PREFETCH_MAX_RETRIES = int(os.getenv("PREFETCH_MAX_RETRIES", "10"))
 
 # Deadline interno: encerra com resumo antes do timeout-minutes do runner matar o job.
 DEADLINE_MIN = float(os.getenv("PIPELINE_DEADLINE_MIN", "0") or 0)
@@ -248,10 +251,10 @@ def prefetch_origem(spreadsheet) -> bool:
         except RETRYABLE_EXC as e:
             attempt += 1
             code = _status_code_from_apierror(e)
-            if attempt >= MAX_API_RETRIES or (code is not None and code not in RETRYABLE_CODES) or deadline_exceeded():
+            if attempt >= PREFETCH_MAX_RETRIES or (code is not None and code not in RETRYABLE_CODES) or deadline_exceeded():
                 print(f"⚠️  Leitura em lote falhou ({e}) — réplicas vão ler a origem individualmente.", flush=True)
                 return False
-            print(f"[batchGet origem] ⚠️  {e} — retry {attempt}/{MAX_API_RETRIES-1}", flush=True)
+            print(f"[batchGet origem] ⚠️  {e} — retry {attempt}/{PREFETCH_MAX_RETRIES-1}", flush=True)
             _sleep_backoff(attempt)
         except Exception as e:
             print(f"⚠️  Leitura em lote falhou ({e}) — réplicas vão ler a origem individualmente.", flush=True)
