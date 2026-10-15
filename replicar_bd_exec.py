@@ -17,6 +17,7 @@ except Exception:
     pass
 
 import gspread
+import cache_origem
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
@@ -192,10 +193,12 @@ def tratar_par_ab(a_raw, b_raw):
     return [a_val if a_val is not None else "", b_val if b_val is not None else ""]
 
 # ========= LER FONTE via Values API =========
-print(f"📥 Lendo {ID_ORIGEM}/{ABA} (A2:B) via Values API…")
-book_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem")
-resp = _with_retry(book_src.values_get, f"{ABA}!A2:B", desc="values_get A2:B")
-vals = resp.get("values", []) if isinstance(resp, dict) else (resp or [])
+vals = cache_origem.carregar("bd_exec_ab")
+if vals is None:
+    print(f"📥 Lendo {ID_ORIGEM}/{ABA} (A2:B) via Values API…")
+    book_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem")
+    resp = _with_retry(book_src.values_get, f"{ABA}!A2:B", desc="values_get A2:B")
+    vals = resp.get("values", []) if isinstance(resp, dict) else (resp or [])
 
 linhas: List[List[str]] = []
 for r in vals:

@@ -9,6 +9,7 @@ import random
 from typing import List
 
 import gspread
+import cache_origem
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
@@ -161,9 +162,11 @@ def tratar_linha(row: List[str], n_cols: int):
 def ler_master():
     creds = make_creds()
     gc = gspread.authorize(creds)
-    print(f"📥 Lendo {ID_MASTER}/{ABA} ({RANGE_ORIGEM})…")
-    ws_src = _with_retry(gc.open_by_key, ID_MASTER, desc="open_by_key master").worksheet(ABA)
-    vals = _with_retry(ws_src.get, RANGE_ORIGEM, desc="get A1:Q") or []
+    vals = cache_origem.carregar("med_parcial")
+    if vals is None:
+        print(f"📥 Lendo {ID_MASTER}/{ABA} ({RANGE_ORIGEM})…")
+        ws_src = _with_retry(gc.open_by_key, ID_MASTER, desc="open_by_key master").worksheet(ABA)
+        vals = _with_retry(ws_src.get, RANGE_ORIGEM, desc="get A1:Q") or []
     if not vals:
         print("⚠️ Nada a replicar (faixa vazia).")
         sys.exit(0)

@@ -8,3 +8,5 @@ credenciais.json
 
 # Logs gerados pela esteira
 logs.txt
+# Cache da leitura em lote da origem (atualizar_replicar.py)
+.cache_origem/

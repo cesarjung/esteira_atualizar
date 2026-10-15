@@ -39,6 +39,8 @@ from typing import Dict, List, Tuple, Optional
 import gspread
 from gspread.exceptions import APIError
 
+import cache_origem
+
 # Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
 # sitecustomize.py) uma chamada lenta levanta requests.exceptions.ReadTimeout,
 # que NAO e APIError e escapava de todos os wrappers deste repo — o script
@@ -224,6 +226,46 @@ def _values_get_resilient(spreadsheet, a1_range: str, desc: str, max_retries: in
                 raise
             print(f"[{desc}] ⚠️  {e} — retry {attempt}/{max_retries-1}", flush=True)
             _sleep_backoff(attempt)
+
+def prefetch_origem(spreadsheet) -> bool:
+    """UM values:batchGet com os ranges das 8 replicas (ver cache_origem.py).
+
+    Paga a lentidao da origem uma vez em vez de oito. Qualquer falha so desliga
+    o cache: as replicas voltam a ler a origem individualmente, como antes.
+    """
+    os.environ.pop(cache_origem.ENV_DIR, None)
+    if os.getenv("ORIGEM_PREFETCH", "1").strip() == "0":
+        print("ℹ️  ORIGEM_PREFETCH=0 — réplicas leem a origem individualmente.", flush=True)
+        return False
+    banner("LEITURA EM LOTE DA ORIGEM para as réplicas (values:batchGet)")
+    ranges = list(cache_origem.RANGES.values())
+    start = time.perf_counter()
+    attempt = 0
+    while True:
+        try:
+            resp = spreadsheet.values_batch_get(ranges)
+            break
+        except RETRYABLE_EXC as e:
+            attempt += 1
+            code = _status_code_from_apierror(e)
+            if attempt >= MAX_API_RETRIES or (code is not None and code not in RETRYABLE_CODES) or deadline_exceeded():
+                print(f"⚠️  Leitura em lote falhou ({e}) — réplicas vão ler a origem individualmente.", flush=True)
+                return False
+            print(f"[batchGet origem] ⚠️  {e} — retry {attempt}/{MAX_API_RETRIES-1}", flush=True)
+            _sleep_backoff(attempt)
+        except Exception as e:
+            print(f"⚠️  Leitura em lote falhou ({e}) — réplicas vão ler a origem individualmente.", flush=True)
+            return False
+    vrs = (resp or {}).get("valueRanges", []) or []
+    if len(vrs) != len(ranges):
+        print(f"⚠️  batchGet devolveu {len(vrs)} ranges (esperado {len(ranges)}) — sem cache.", flush=True)
+        return False
+    cache_dir = Path(__file__).parent.resolve() / ".cache_origem"
+    cache_origem.gravar(cache_dir, vrs)
+    os.environ[cache_origem.ENV_DIR] = str(cache_dir)  # herdado pelos subprocess das réplicas
+    resumo = ", ".join(f"{k}={len(vr.get('values', []) or [])}" for k, vr in zip(cache_origem.RANGES, vrs))
+    print(f"✅ Origem lida em lote em {time.perf_counter() - start:.1f}s: {resumo}", flush=True)
+    return True
 
 def get_status_map(ws, rows: List[int]) -> Dict[int, str]:
     if not rows:
@@ -456,7 +498,8 @@ def main():
     _safe_update_DE(ws, 1, fmt_now(), "OK (BLOCOS 1+2)")
     print("✅ Atualizações OK. Timestamp gravado em BD_Config!D1:E1.", flush=True)
 
-    # RÉPLICAS
+    # RÉPLICAS — origem lida uma vez só, logo após o BLOCO 2 (mesmo retrato para as 8)
+    prefetch_origem(ws.spreadsheet)
     ok_replicas = run_replicas(base_dir)
 
     total_time = time.perf_counter() - overall_start

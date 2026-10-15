@@ -7,6 +7,7 @@ import sys
 import random
 
 import gspread
+import cache_origem
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
@@ -190,9 +191,11 @@ def safe_update(ws, a1_range, values, user_entered=True, tag="update"):
 # LEITURA DA ORIGEM
 # =========================
 def ler_origem(gc):
-    print(f"📥 Lendo dados de {ID_ORIGEM}/{ABA_ORIGEM} …")
-    ws_origem = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem").worksheet(ABA_ORIGEM)
-    valores  = _with_retry(ws_origem.get_all_values, desc="get_all_values zps") or []
+    valores = cache_origem.carregar("zps", retangular=True)  # get_all_values preenche
+    if valores is None:
+        print(f"📥 Lendo dados de {ID_ORIGEM}/{ABA_ORIGEM} …")
+        ws_origem = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem").worksheet(ABA_ORIGEM)
+        valores  = _with_retry(ws_origem.get_all_values, desc="get_all_values zps") or []
     if not valores:
         print("⚠️ Aba 'zps' vazia.")
         sys.exit(0)

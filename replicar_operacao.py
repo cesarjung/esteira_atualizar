@@ -8,6 +8,7 @@ import sys
 import random
 
 import gspread
+import cache_origem
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
@@ -166,9 +167,11 @@ def tratar_linha(row, n_cols):
 
 # ========== LEITURA (MASTER) ==========
 def ler_fonte(gc):
-    print(f"📥 Lendo {ID_PRINCIPAL}/{ABA_FONTE} ({RANGE_ORIGEM})…")
-    ws_src = _with_retry(gc.open_by_key, ID_PRINCIPAL, desc="open_by_key master").worksheet(ABA_FONTE)
-    vals = _with_retry(ws_src.get, RANGE_ORIGEM, desc='get A1:M') or []
+    vals = cache_origem.carregar("operacao")
+    if vals is None:
+        print(f"📥 Lendo {ID_PRINCIPAL}/{ABA_FONTE} ({RANGE_ORIGEM})…")
+        ws_src = _with_retry(gc.open_by_key, ID_PRINCIPAL, desc="open_by_key master").worksheet(ABA_FONTE)
+        vals = _with_retry(ws_src.get, RANGE_ORIGEM, desc='get A1:M') or []
     if not vals:
         print("⚠️ Nada a replicar (faixa vazia).")
         sys.exit(0)

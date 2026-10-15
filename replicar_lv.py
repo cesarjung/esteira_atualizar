@@ -9,6 +9,7 @@ import random
 from typing import List
 
 import gspread
+import cache_origem
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
@@ -222,10 +223,12 @@ def main():
     gc = gspread.authorize(creds)
 
     # --- Ler fonte ---
-    print(f"📥 Lendo {ID_FONTE}/{ABA_FONTE} ({RANGE_FONTE})…")
-    sh_src = _with_retry(gc.open_by_key, ID_FONTE, desc="open_by_key fonte")
-    ws_src = _with_retry(sh_src.worksheet, ABA_FONTE, desc="worksheet fonte")
-    vals = _with_retry(ws_src.get, RANGE_FONTE, desc=f"get {RANGE_FONTE}") or []
+    vals = cache_origem.carregar("lv")
+    if vals is None:
+        print(f"📥 Lendo {ID_FONTE}/{ABA_FONTE} ({RANGE_FONTE})…")
+        sh_src = _with_retry(gc.open_by_key, ID_FONTE, desc="open_by_key fonte")
+        ws_src = _with_retry(sh_src.worksheet, ABA_FONTE, desc="worksheet fonte")
+        vals = _with_retry(ws_src.get, RANGE_FONTE, desc=f"get {RANGE_FONTE}") or []
     if not vals:
         print("⚠️ Nada a replicar (faixa vazia).")
         sys.exit(0)

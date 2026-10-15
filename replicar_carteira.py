@@ -16,6 +16,7 @@ except Exception:
     pass
 
 import gspread
+import cache_origem
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
@@ -172,10 +173,12 @@ def aplicar_formatacao(ws, colunas_numericas: List[int]):
 # ========= I/O PRINCIPAL =========
 def ler_master_A_S(gc: gspread.Client) -> Tuple[List[str], List[List]]:
     """Lê master (Carteira) A1:S (cabeçalho + dados)."""
-    print(f"📖 Abrindo master {ID_MASTER}/{ABA} …")
-    sh = with_retry(gc.open_by_key, ID_MASTER, desc="open_by_key master")
-    ws = with_retry(sh.worksheet, ABA, desc="worksheet master")
-    valores = with_retry(ws.get, "A1:S", desc="get A1:S") or []
+    valores = cache_origem.carregar("carteira")
+    if valores is None:
+        print(f"📖 Abrindo master {ID_MASTER}/{ABA} …")
+        sh = with_retry(gc.open_by_key, ID_MASTER, desc="open_by_key master")
+        ws = with_retry(sh.worksheet, ABA, desc="worksheet master")
+        valores = with_retry(ws.get, "A1:S", desc="get A1:S") or []
     if not valores:
         return [], []
     cabecalho = valores[0]

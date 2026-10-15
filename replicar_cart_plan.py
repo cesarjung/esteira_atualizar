@@ -17,6 +17,7 @@ except Exception:
     pass
 
 import gspread
+import cache_origem
 from google.oauth2.service_account import Credentials as SACreds
 from gspread.exceptions import APIError, WorksheetNotFound
 
@@ -197,9 +198,11 @@ def tratar_row_fghij(r5):
     return r
 
 # ========= LER FONTE (Values API) =========
-print(f"📥 Lendo {ID_ORIGEM}/{ABA} ({SRC_RANGE}) via Values API…")
-book_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem")
-vals = _values_get(book_src, f"{ABA}!{SRC_RANGE}")  # lista de linhas
+vals = cache_origem.carregar("bd_exec_fj")
+if vals is None:
+    print(f"📥 Lendo {ID_ORIGEM}/{ABA} ({SRC_RANGE}) via Values API…")
+    book_src = _with_retry(gc.open_by_key, ID_ORIGEM, desc="open_by_key origem")
+    vals = _values_get(book_src, f"{ABA}!{SRC_RANGE}")  # lista de linhas
 
 linhas: List[List[str]] = []
 for r in vals:

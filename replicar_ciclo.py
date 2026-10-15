@@ -9,6 +9,7 @@ import random
 from typing import List, Tuple
 
 import gspread
+import cache_origem
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # Falha de rede tambem e retentavel: com HTTP_TIMEOUT definido (ver
@@ -261,10 +262,12 @@ def main():
     gc = gspread.authorize(creds)
 
     # --- Ler master ---
-    print(f"📥 Lendo {ID_MASTER}/{ABA_CICLO} ({RANGE_ORIGEM})…")
-    sh_src = _with_retry(gc.open_by_key, ID_MASTER, desc="open_by_key master")
-    ws_src = _with_retry(sh_src.worksheet, ABA_CICLO, desc="worksheet master")
-    vals = _with_retry(ws_src.get, RANGE_ORIGEM, desc=f"get {RANGE_ORIGEM}") or []
+    vals = cache_origem.carregar("ciclo")
+    if vals is None:
+        print(f"📥 Lendo {ID_MASTER}/{ABA_CICLO} ({RANGE_ORIGEM})…")
+        sh_src = _with_retry(gc.open_by_key, ID_MASTER, desc="open_by_key master")
+        ws_src = _with_retry(sh_src.worksheet, ABA_CICLO, desc="worksheet master")
+        vals = _with_retry(ws_src.get, RANGE_ORIGEM, desc=f"get {RANGE_ORIGEM}") or []
     if not vals:
         print("⚠️ Nada a replicar (faixa vazia).")
         sys.exit(0)
