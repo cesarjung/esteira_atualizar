@@ -99,6 +99,12 @@ BLOCK2 = [
     ("importador_carteira.py", 9),
 ]
 
+# Depois do BLOCO 2: aplica as fórmulas da BD_Carteira (modelo em BD_Formulas),
+# espera calcular e cola como valores. Com as fórmulas vivas, toda escrita nas
+# abas de origem recalculava a BD_Carteira inteira e a planilha travava.
+# CONGELAR_BD_CARTEIRA=0 desliga.
+SCRIPT_CONGELAR = "congelar_bd_carteira.py"
+
 # =======================
 # CONFIG DAS RÉPLICAS
 # =======================
@@ -501,17 +507,30 @@ def main():
     _safe_update_DE(ws, 1, fmt_now(), "OK (BLOCOS 1+2)")
     print("✅ Atualizações OK. Timestamp gravado em BD_Config!D1:E1.", flush=True)
 
+    # CONGELAR BD_Carteira — antes das réplicas, para elas lerem a planilha já leve.
+    # Falha aqui não interrompe: as fórmulas ficam no lugar (aba certa, só pesada).
+    ok_congelar = True
+    if os.getenv("CONGELAR_BD_CARTEIRA", "1").strip() == "0":
+        print("ℹ️  CONGELAR_BD_CARTEIRA=0 — BD_Carteira mantida com fórmulas.", flush=True)
+    elif deadline_exceeded():
+        print(f"⏰ Deadline de {DEADLINE_MIN:.0f} min atingido — {SCRIPT_CONGELAR} não executado.", flush=True)
+        ok_congelar = False
+    else:
+        banner("CONGELAR BD_Carteira: fórmulas → cálculo → valores")
+        ok_congelar = run_script_once(base_dir / SCRIPT_CONGELAR, 1, 1) == 0
+
     # RÉPLICAS — origem lida uma vez só, logo após o BLOCO 2 (mesmo retrato para as 8)
     prefetch_origem(ws.spreadsheet)
     ok_replicas = run_replicas(base_dir)
 
     total_time = time.perf_counter() - overall_start
     banner(f"FIM DO ORQUESTRADOR – Tempo total: {total_time:.1f}s")
-    if not ok_replicas:
-        print("Resumo geral: Atualizações OK, mas houve falhas em réplicas.", flush=True)
+    if not ok_replicas or not ok_congelar:
+        falhas = [n for n, ok in (("réplicas", ok_replicas), ("congelar BD_Carteira", ok_congelar)) if not ok]
+        print(f"Resumo geral: Atualizações OK, mas houve falha em: {', '.join(falhas)}.", flush=True)
         sys.exit(1)
     else:
-        print("Resumo geral: Atualizações OK e réplicas OK. ✅", flush=True)
+        print("Resumo geral: Atualizações OK, BD_Carteira congelada e réplicas OK. ✅", flush=True)
 
 if __name__ == "__main__":
     main()

@@ -22,6 +22,7 @@ on:
           - importador_carteira.py
           - importador_carteira_lv.py
           - importador_historico.py
+          - congelar_bd_carteira.py
           - replicar_zps.py
           - replicar_ciclo.py
           - replicar_lv.py
