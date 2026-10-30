@@ -22,12 +22,13 @@ env:
   # 363s (2x180s), contra sucesso em 1042s no run 32376629883 sem timeout.
   # O teto existe para pendura infinita, nao para cortar trabalho em curso.
   HTTP_TIMEOUT: "300"
-  PIPELINE_DEADLINE_MIN: "90"    # < timeout-minutes: sai com resumo antes do kill
+  PIPELINE_DEADLINE_MIN: "130"   # < timeout-minutes: sai com resumo antes do kill
+                                 # (+40 em 30/10/2026: congelar_bd_carteira.py espera o cálculo)
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 150
     concurrency:
       # Grupo unico para TODOS os workflows deste repo: os tres escrevem na
       # mesma planilha, e dois processos simultaneos geram HTTP 409

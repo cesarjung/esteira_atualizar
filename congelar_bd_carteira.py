@@ -49,7 +49,8 @@ CAM_CRED       = "credenciais.json"   # fallback local
 
 # Teto para esperar o calculo. A planilha sob carga responde 503 em ~186s por
 # leitura, entao cada volta do laco pode custar alguns minutos.
-ESPERA_MAX_MIN = float(os.getenv("CONGELAR_ESPERA_MAX_MIN", "30"))
+# Run 41113076236: 5 leituras com 503 antes da primeira completa (~17 min).
+ESPERA_MAX_MIN = float(os.getenv("CONGELAR_ESPERA_MAX_MIN", "45"))
 ESPERA_INTERVALO_S = 20
 MAX_API_RETRIES = 6
 RETRYABLE_CODES = {404, 408, 409, 429, 500, 502, 503, 504}
@@ -159,9 +160,11 @@ def ler_modelo(sh, largura):
     return formulas
 
 def contar_projetos(sh):
-    """Projetos unicos da Carteira = linhas que o UNIQUE de A3 vai gerar."""
+    """Projetos unicos da Carteira = linhas que o UNIQUE de A3 vai gerar.
+    Lido como FORMULA: a Carteira nao tem formula, entao vem o mesmo valor, sem
+    esperar o recalculo da planilha (FORMATTED_VALUE levou 11 min de 503)."""
     resp = com_retry("ler Carteira!A", lambda: sh.values_batch_get(
-        [f"'{ABA_CARTEIRA}'!A1:A"]))
+        [f"'{ABA_CARTEIRA}'!A1:A"], params={"valueRenderOption": "FORMULA"}))
     col = [str(r[0]).strip() if r else "" for r in valores(resp)[0]]
     unicos = {v for v in col[1:] if v}  # col[0] = cabecalho (vira A3)
     return len(unicos)

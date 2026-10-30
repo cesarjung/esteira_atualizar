@@ -517,6 +517,11 @@ def main():
         ok_congelar = False
     else:
         banner("CONGELAR BD_Carteira: fórmulas → cálculo → valores")
+        if DEADLINE_MIN > 0:
+            # Espera do cálculo cabe no que sobra do deadline, com 15 min para as réplicas.
+            sobra = DEADLINE_MIN - (time.monotonic() - _T0) / 60.0 - 15
+            os.environ["CONGELAR_ESPERA_MAX_MIN"] = f"{max(5.0, min(45.0, sobra)):.0f}"
+            print(f"⏱️  Espera máxima do cálculo: {os.environ['CONGELAR_ESPERA_MAX_MIN']} min", flush=True)
         ok_congelar = run_script_once(base_dir / SCRIPT_CONGELAR, 1, 1) == 0
 
     # RÉPLICAS — origem lida uma vez só, logo após o BLOCO 2 (mesmo retrato para as 8)

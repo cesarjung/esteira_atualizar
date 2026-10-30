@@ -39,7 +39,7 @@ env:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90   # congelar_bd_carteira.py espera o cálculo por até 45 min
     concurrency:
       # Compartilha o grupo com os demais workflows: evita dois processos
       # escrevendo na mesma planilha ao mesmo tempo.
