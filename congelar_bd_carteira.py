@@ -19,6 +19,12 @@
 # Se a linha 2 da BD_Formulas estiver vazia e a BD_Carteira ainda tiver
 # formulas, o script semeia o modelo a partir dela antes de seguir.
 #
+# Colunas VIVAS (COLS_VIVAS): continuam formula depois do congelamento porque
+# leem parametros digitados na aba Esteira (datas, checkboxes de unidade,
+# periodo de conclusoes) direto ou via Z. Elas so dependem da Esteira e de
+# colunas da propria BD_Carteira, entao escritas em Carteira/CICLO/zps/... nao
+# as recalculam. Achadas pelo cabecalho, nao pela letra.
+#
 # Seguranca: nada e limpo antes das formulas entrarem (a mesma escrita troca
 # valores velhos por formulas). Se a espera pelo calculo estourar, as formulas
 # ficam no lugar — a aba continua certa, so pesada como antes — e sai com 1.
@@ -46,6 +52,12 @@ ULTIMA_COL     = "AN"
 LINHA_CAB      = 3    # cabecalho da BD_Carteira (A3 e a formula da coluna A)
 LINHA_DADOS    = 4    # ancora das formulas B..AN
 CAM_CRED       = "credenciais.json"   # fallback local
+
+# Cabecalhos das colunas que NAO sao congeladas (hoje Z, AA, AB, AD, AK).
+# Diretas na Esteira: Status, Filtro Unidade, Status Producao x Ciclo;
+# via Status: Grupo, Valor Considerado.
+COLS_VIVAS = ("Status", "Grupo", "Valor Considerado", "Filtro Unidade",
+              "Status Produção x Ciclo")
 
 # Teto para esperar o calculo. A planilha sob carga responde 503 em ~186s por
 # leitura, entao cada volta do laco pode custar alguns minutos.
@@ -157,7 +169,29 @@ def ler_modelo(sh, largura):
         raise RuntimeError(f"{ABA_MODELO}!A2 (coluna vital A) não tem fórmula.")
     if vazias:
         log(f"ℹ️ Colunas sem fórmula no modelo (ficam vazias): {', '.join(vazias)}")
-    return formulas
+    return formulas, cab_mod
+
+def achar_vivas(cab_mod):
+    """Indices (0-based) das COLS_VIVAS pelo cabecalho do modelo."""
+    pos = {norm(c): j for j, c in enumerate(cab_mod) if j > 0}
+    faltando = [c for c in COLS_VIVAS if norm(c) not in pos]
+    if faltando:
+        raise RuntimeError(f"Colunas vivas não achadas no cabeçalho da {ABA_MODELO}: {', '.join(faltando)}")
+    return sorted(pos[norm(c)] for c in COLS_VIVAS)
+
+def faixas_congelar(largura, vivas):
+    """Faixas contiguas [ini, fim) de colunas a congelar (todas menos as vivas)."""
+    faixas, j = [], 0
+    while j < largura:
+        if j in vivas:
+            j += 1
+            continue
+        k = j
+        while k < largura and k not in vivas:
+            k += 1
+        faixas.append((j, k))
+        j = k
+    return faixas
 
 def contar_projetos(sh):
     """Projetos unicos da Carteira = linhas que o UNIQUE de A3 vai gerar.
@@ -224,10 +258,11 @@ def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
 def _hash(vals):
     return hashlib.sha256(json.dumps(vals, ensure_ascii=False).encode()).hexdigest()
 
-def esperar_calculo(sh, ws, largura, por_linha, ultima, esperado):
+def esperar_calculo(sh, ws, largura, por_linha, vivas, ultima, esperado):
     """Le os valores ate nenhuma celula estar carregando e duas leituras
     seguidas sairem identicas. A extensao real e a do UNIQUE em A: se passar de
-    `ultima`, estende as formulas por linha e recomeca. Devolve (ultima, hash)."""
+    `ultima`, estende as formulas por linha e recomeca. Devolve (ultima, hash
+    das colunas congeladas)."""
     limite = time.monotonic() + ESPERA_MAX_MIN * 60
     anterior = None
     volta = 0
@@ -254,7 +289,7 @@ def esperar_calculo(sh, ws, largura, por_linha, ultima, esperado):
             copiar_por_linha(sh, ws, por_linha, ultima)
             anterior = None
         elif n_a > 0 and carregando == 0:
-            h = _hash([linha(vals, i, largura) for i in range(ultima - LINHA_CAB + 1)])
+            h = _hash(_so_congeladas(vals, largura, vivas, ultima))
             if h == anterior:
                 ancora = linha(vals, LINHA_DADOS - LINHA_CAB, largura)
                 quebradas = [col_letra(j + 1) for j, c in enumerate(ancora) if str(c).startswith("#REF")]
@@ -270,21 +305,34 @@ def esperar_calculo(sh, ws, largura, por_linha, ultima, esperado):
         time.sleep(ESPERA_INTERVALO_S)
     raise RuntimeError(f"Cálculo não estabilizou em {ESPERA_MAX_MIN:.0f} min — fórmulas mantidas na {ABA_ALVO}.")
 
-def colar_valores(sh, ws, largura, ultima):
-    rng = {"sheetId": ws.id, "startRowIndex": LINHA_CAB - 1, "endRowIndex": ultima,
-           "startColumnIndex": 0, "endColumnIndex": largura}
-    com_retry("colar como valores", lambda: sh.batch_update({"requests": [{"copyPaste": {
-        "source": rng, "destination": rng, "pasteType": "PASTE_VALUES"}}]}))
+def colar_valores(sh, ws, faixas, ultima):
+    reqs = []
+    for ini, fim in faixas:
+        rng = {"sheetId": ws.id, "startRowIndex": LINHA_CAB - 1, "endRowIndex": ultima,
+               "startColumnIndex": ini, "endColumnIndex": fim}
+        reqs.append({"copyPaste": {"source": rng, "destination": rng, "pasteType": "PASTE_VALUES"}})
+    com_retry("colar como valores", lambda: sh.batch_update({"requests": reqs}))
 
-def conferir(sh, largura, ultima, hash_calc):
+def _so_congeladas(vals, largura, vivas, ultima):
+    return [[c for j, c in enumerate(linha(vals, i, largura)) if j not in vivas]
+            for i in range(ultima - LINHA_CAB + 1)]
+
+def conferir(sh, largura, vivas, ultima, hash_calc):
+    """Colunas congeladas: sem formula e com os valores calculados.
+    Colunas vivas: formula ainda na linha 4."""
     rng = f"'{ABA_ALVO}'!A{LINHA_CAB}:{col_letra(largura)}{ultima}"
     resp = com_retry("conferir fórmulas", lambda: sh.values_batch_get(
         [rng], params={"valueRenderOption": "FORMULA"}))
-    restantes = sum(1 for r in valores(resp)[0] for c in r if str(c).startswith("="))
+    form = valores(resp)[0]
+    restantes = sum(1 for r in _so_congeladas(form, largura, vivas, ultima) for c in r if str(c).startswith("="))
     if restantes:
-        raise RuntimeError(f"Ainda há {restantes} fórmulas em {rng} após colar valores.")
+        raise RuntimeError(f"Ainda há {restantes} fórmulas nas colunas congeladas após colar valores.")
+    ancora = linha(form, LINHA_DADOS - LINHA_CAB, largura)
+    sem = [col_letra(j + 1) for j in vivas if not str(ancora[j]).startswith("=")]
+    if sem:
+        raise RuntimeError(f"Colunas vivas perderam a fórmula na linha {LINHA_DADOS}: {', '.join(sem)}")
     vals = com_retry("conferir valores", lambda: valores(sh.values_batch_get([rng]))[0])
-    if _hash([linha(vals, i, largura) for i in range(ultima - LINHA_CAB + 1)]) != hash_calc:
+    if _hash(_so_congeladas(vals, largura, vivas, ultima)) != hash_calc:
         raise RuntimeError("Valores após colar diferem dos calculados — conferir a aba manualmente.")
 
 # ========= EXECUÇÃO =========
@@ -295,7 +343,10 @@ def main():
     ws = sh.worksheet(ABA_ALVO)
     largura = col_num(ULTIMA_COL)
 
-    formulas = ler_modelo(sh, largura)
+    formulas, cab_mod = ler_modelo(sh, largura)
+    vivas = achar_vivas(cab_mod)
+    faixas = faixas_congelar(largura, vivas)
+    log(f"🌿 Colunas vivas (seguem fórmula): {', '.join(col_letra(j + 1) for j in vivas)}.")
     n = contar_projetos(sh)
     ultima = LINHA_DADOS - 1 + n
     por_linha = colunas_por_linha(formulas)
@@ -305,12 +356,13 @@ def main():
 
     aplicar_formulas(sh, ws, formulas, por_linha, ultima)
     t_calc = time.perf_counter()
-    ultima, h = esperar_calculo(sh, ws, largura, por_linha, ultima, n)
+    ultima, h = esperar_calculo(sh, ws, largura, por_linha, vivas, ultima, n)
     log(f"✅ Cálculo estável em {time.perf_counter() - t_calc:.0f}s.")
 
-    colar_valores(sh, ws, largura, ultima)
-    conferir(sh, largura, ultima, h)
-    log(f"🧊 {ABA_ALVO} congelada em valores (A{LINHA_CAB}:{ULTIMA_COL}{ultima}). "
+    colar_valores(sh, ws, faixas, ultima)
+    conferir(sh, largura, vivas, ultima, h)
+    log(f"🧊 {ABA_ALVO} congelada em valores (A{LINHA_CAB}:{ULTIMA_COL}{ultima}, "
+        f"menos {', '.join(col_letra(j + 1) for j in vivas)}). "
         f"Duração total {time.perf_counter() - t0:.0f}s.")
 
 if __name__ == "__main__":
