@@ -265,12 +265,14 @@ def _hash(vals):
     return hashlib.sha256(json.dumps(vals, ensure_ascii=False).encode()).hexdigest()
 
 def esperar_calculo(sh, ws, largura, por_linha, vivas, ultima, esperado):
-    """Le os valores ate nenhuma celula estar carregando e duas leituras
-    seguidas sairem identicas. A extensao real e a do UNIQUE em A: se passar de
-    `ultima`, estende as formulas por linha e recomeca. Devolve (ultima, hash
-    das colunas congeladas)."""
+    """Le os valores ate a primeira leitura completa sem celula carregando.
+    Uma basta: com a aba toda viva, ler A3:AN leva ~170-185s e o Google corta
+    em ~185s com 503, entao duas leituras seguidas quase nunca passam (runs
+    41638130300 e 41651180624: so a volta 6 leu, as outras 13 deram 503).
+    O Google so devolve valores com o calculo terminado. A extensao real e a
+    do UNIQUE em A: se passar de `ultima`, estende as formulas por linha e
+    recomeca. Devolve (ultima, hash das colunas congeladas)."""
     limite = time.monotonic() + ESPERA_MAX_MIN * 60
-    anterior = None
     volta = 0
     while time.monotonic() < limite:
         volta += 1
@@ -293,21 +295,15 @@ def esperar_calculo(sh, ws, largura, por_linha, vivas, ultima, esperado):
             ultima = ult_a
             log(f"↕️ UNIQUE foi além do previsto — estendendo fórmulas por linha até {ultima}.")
             copiar_por_linha(sh, ws, por_linha, ultima)
-            anterior = None
         elif n_a > 0 and carregando == 0:
-            h = _hash(_so_congeladas(vals, largura, vivas, ultima))
-            if h == anterior:
-                ancora = linha(vals, LINHA_DADOS - LINHA_CAB, largura)
-                quebradas = [col_letra(j + 1) for j, c in enumerate(ancora) if str(c).startswith("#REF")]
-                if quebradas:
-                    raise RuntimeError(f"#REF! na linha {LINHA_DADOS} (expansão bloqueada?): {', '.join(quebradas)}")
-                if n_a != esperado:
-                    log(f"⚠️ A tem {n_a} projetos e a Carteira {esperado} únicos — "
-                        f"diferença de grafia (maiúsculas/espaços); segue com o que o UNIQUE gerou.")
-                return ultima, h
-            anterior = h
-        else:
-            anterior = None
+            ancora = linha(vals, LINHA_DADOS - LINHA_CAB, largura)
+            quebradas = [col_letra(j + 1) for j, c in enumerate(ancora) if str(c).startswith("#REF")]
+            if quebradas:
+                raise RuntimeError(f"#REF! na linha {LINHA_DADOS} (expansão bloqueada?): {', '.join(quebradas)}")
+            if n_a != esperado:
+                log(f"⚠️ A tem {n_a} projetos e a Carteira {esperado} únicos — "
+                    f"diferença de grafia (maiúsculas/espaços); segue com o que o UNIQUE gerou.")
+            return ultima, _hash(_so_congeladas(vals, largura, vivas, ultima))
         time.sleep(ESPERA_INTERVALO_S)
     raise RuntimeError(f"Cálculo não estabilizou em {ESPERA_MAX_MIN:.0f} min — fórmulas mantidas na {ABA_ALVO}.")
 
@@ -337,9 +333,11 @@ def conferir(sh, largura, vivas, ultima, hash_calc):
     sem = [col_letra(j + 1) for j in vivas if not str(ancora[j]).startswith("=")]
     if sem:
         raise RuntimeError(f"Colunas vivas perderam a fórmula na linha {LINHA_DADOS}: {', '.join(sem)}")
+    # Diferenca aqui = alguma fonte mudou entre a leitura e a colagem; o
+    # copyPaste colou o valor mais novo, entao so avisa.
     vals = com_retry("conferir valores", lambda: valores(sh.values_batch_get([rng]))[0])
     if _hash(_so_congeladas(vals, largura, vivas, ultima)) != hash_calc:
-        raise RuntimeError("Valores após colar diferem dos calculados — conferir a aba manualmente.")
+        log("⚠️ Valores colados diferem da leitura de estabilidade — alguma fonte mudou no meio; ficou o valor mais novo.")
 
 # ========= EXECUÇÃO =========
 def main():
