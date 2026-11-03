@@ -11,8 +11,8 @@
 #
 # Modelo das formulas: aba BD_Formulas, linha 1 = cabecalho na mesma ordem da
 # BD_Carteira, linha 2 = formula de cada coluna como TEXTO (gravada RAW, para
-# nao calcular ali). Coluna A vai para A3 (=UNIQUE da Carteira, a coluna vital);
-# as demais vao para a linha 4. Coluna cujo modelo nao usa intervalo aberto
+# nao calcular ali). Todas vao para a linha 4; a coluna A (=UNIQUE(Carteira!A2:A),
+# a coluna vital) tambem, e A3 fica com o cabecalho. Coluna cujo modelo nao usa intervalo aberto
 # (A4:A) e formula POR LINHA (hoje Z e AK) e e copiada para baixo so ate o
 # ultimo projeto, nao ate a linha 20000.
 #
@@ -49,8 +49,8 @@ ABA_ALVO       = "BD_Carteira"
 ABA_MODELO     = "BD_Formulas"
 ABA_CARTEIRA   = "Carteira"
 ULTIMA_COL     = "AN"
-LINHA_CAB      = 3    # cabecalho da BD_Carteira (A3 e a formula da coluna A)
-LINHA_DADOS    = 4    # ancora das formulas B..AN
+LINHA_CAB      = 3    # cabecalho da BD_Carteira
+LINHA_DADOS    = 4    # ancora das formulas A..AN
 CAM_CRED       = "credenciais.json"   # fallback local
 
 # Cabecalhos das colunas que NAO sao congeladas (hoje Z, AA, AB, AD, AK).
@@ -143,9 +143,9 @@ def ler_modelo(sh, largura):
     cab3     = linha(cab_alvo, 1, largura)
 
     # Cabecalho do modelo tem de bater coluna a coluna com o da BD_Carteira
-    # (linha 3, ou linha 2 onde ela tiver titulo). A3 e formula: coluna A livre.
+    # (linha 3, ou linha 2 onde ela tiver titulo).
     erradas = []
-    for j in range(1, largura):
+    for j in range(largura):
         aceitos = {norm(cab3[j]), norm(cab2[j])} - {""}
         if aceitos and norm(cab_mod[j]) not in aceitos:
             erradas.append(f"{col_letra(j + 1)} ('{cab_mod[j]}' ≠ '{cab3[j]}')")
@@ -153,7 +153,7 @@ def ler_modelo(sh, largura):
         raise RuntimeError(f"Cabeçalho da {ABA_MODELO} não bate com a {ABA_ALVO}: " + "; ".join(erradas))
 
     if not any(str(f).strip() for f in formulas):
-        atual = [cab3[0]] + linha(ancora, 0, largura)[1:]
+        atual = linha(ancora, 0, largura)
         if not str(atual[0]).startswith("="):
             raise RuntimeError(f"{ABA_MODELO}!A2 vazia e a {ABA_ALVO} não tem fórmulas para semear o modelo.")
         log(f"🌱 {ABA_MODELO} linha 2 vazia — semeando com as fórmulas atuais da {ABA_ALVO}.")
@@ -194,13 +194,13 @@ def faixas_congelar(largura, vivas):
     return faixas
 
 def contar_projetos(sh):
-    """Projetos unicos da Carteira = linhas que o UNIQUE de A3 vai gerar.
+    """Projetos unicos da Carteira = linhas que o UNIQUE de A4 vai gerar.
     Lido como FORMULA: a Carteira nao tem formula, entao vem o mesmo valor, sem
     esperar o recalculo da planilha (FORMATTED_VALUE levou 11 min de 503)."""
     resp = com_retry("ler Carteira!A", lambda: sh.values_batch_get(
         [f"'{ABA_CARTEIRA}'!A1:A"], params={"valueRenderOption": "FORMULA"}))
     col = [str(r[0]).strip() if r else "" for r in valores(resp)[0]]
-    unicos = {v for v in col[1:] if v}  # col[0] = cabecalho (vira A3)
+    unicos = {v for v in col[1:] if v}  # col[0] = cabecalho (fora do A2:A)
     return len(unicos)
 
 def colunas_por_linha(formulas):
@@ -229,18 +229,25 @@ def copiar_por_linha(sh, ws, por_linha, ultima):
             f"copiadas até a linha {ultima}.")
 
 def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
-    """UMA escrita troca os valores congelados pelas formulas (nada e limpo
-    antes); depois copia as formulas por linha ate `ultima`."""
+    """Primeiro as formulas por linha (linha 4 + copia ate `ultima`), enquanto
+    o resto da aba ainda esta congelado e a planilha responde rapido; depois
+    UMA escrita troca os valores congelados pelas formulas de array (nada e
+    limpo antes). Na ordem inversa a copia caia no recalculo e voltava 503
+    (run 41635040839: 6 tentativas, ~20 min, falhou)."""
     largura = len(formulas)
     grade = ws.row_count
+    if por_linha:
+        com_retry("gravar fórmulas por linha", lambda: sh.values_batch_update(
+            {"valueInputOption": "USER_ENTERED",
+             "data": [{"range": f"'{ABA_ALVO}'!{col_letra(j + 1)}{LINHA_DADOS}",
+                       "values": [[formulas[j]]]} for j in por_linha]}))
+        copiar_por_linha(sh, ws, por_linha, ultima)
     # Faixas contiguas de colunas de array: linha 4 = formula, linhas 5..grade
     # = "" para o ARRAYFORMULA ter onde expandir.
-    data = [{"range": f"'{ABA_ALVO}'!A{LINHA_CAB}", "values": [[formulas[0]]]}]
-    j = 1
+    data = []
+    j = 0
     while j < largura:
         if j in por_linha:
-            data.append({"range": f"'{ABA_ALVO}'!{col_letra(j + 1)}{LINHA_DADOS}",
-                         "values": [[formulas[j]]]})
             j += 1
             continue
         k = j
@@ -252,8 +259,7 @@ def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
         j = k + 1
     com_retry("gravar fórmulas", lambda: sh.values_batch_update(
         {"valueInputOption": "USER_ENTERED", "data": data}))
-    log("✍️ Fórmulas gravadas (A3 + linha 4).")
-    copiar_por_linha(sh, ws, por_linha, ultima)
+    log("✍️ Fórmulas de array gravadas (linha 4).")
 
 def _hash(vals):
     return hashlib.sha256(json.dumps(vals, ensure_ascii=False).encode()).hexdigest()
