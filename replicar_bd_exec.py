@@ -77,6 +77,13 @@ CREDENTIALS_PATH_FALLBACK = "credenciais.json"
 # Custo de nao encolher: ~197k celulas por aba, irrelevante perto do teto de 10M.
 ENCOLHER_GRADE = False
 
+# Folga ao aumentar a grade. Crescer o minimo (ex.: +3 linhas) fazia resize em
+# quase todo run, e cada resize recalcula a planilha destino: nos destinos
+# pesados isso custava 3-11 min com 503 (run 41853636903). Com folga, o resize
+# so volta quando os dados passarem dela. As linhas extras ficam vazias (o
+# "limpa rabo" ja cobre ate row_count).
+FOLGA_LINHAS = 500
+
 def make_creds():
     env_json = os.environ.get("GOOGLE_CREDENTIALS")
     if env_json:
@@ -133,7 +140,7 @@ def _ensure_grid(ws, min_rows: int, min_cols_letter: str):
     cur_rows = getattr(ws, "row_count", 0)
     cur_cols = getattr(ws, "col_count", 0)
     if cur_rows < min_rows or cur_cols < min_cols:
-        new_rows = max(cur_rows, min_rows)
+        new_rows = max(cur_rows, min_rows + FOLGA_LINHAS) if cur_rows < min_rows else cur_rows
         new_cols = max(cur_cols, min_cols)
         print(f"🧩 resize → {ws.title}: {cur_rows}x{cur_cols} -> {new_rows}x{new_cols}")
         _with_retry(ws.resize, rows=new_rows, cols=new_cols, desc=f"resize {ws.title}")
