@@ -25,15 +25,25 @@
 #
 # Colunas VIVAS (COLS_VIVAS): continuam formula depois do congelamento porque
 # leem parametros digitados na aba Esteira (datas, checkboxes de unidade,
-# periodo de conclusoes) direto ou via Z. Elas so dependem da Esteira e de
-# colunas da propria BD_Carteira, entao escritas em Carteira/CICLO/zps/... nao
-# as recalculam. Achadas pelo cabecalho, nao pela letra.
+# periodo de conclusoes) direto ou via Z. Achadas pelo cabecalho, nao pela letra.
 #
-# Seguranca: nada e limpo antes das formulas entrarem (a mesma escrita troca
-# valores velhos por formulas). Se a espera pelo calculo estourar, as formulas
-# ficam no lugar — a aba continua certa, so pesada como antes — e sai com 1.
+# Ordem (por blocos):
+#   0. limpa as vivas (linha 4 ate o fim): Z/AK dependem de quase tudo e,
+#      presentes durante o calculo, recalculavam 13 mil linhas a cada coluna
+#      que fechava;
+#   1. coluna A como valor;
+#   2. camadas das colunas congeladas, montadas pelas dependencias entre
+#      colunas da propria aba: camada 1 so usa A (+ outras abas), camada 2
+#      usa a camada 1, ... Cada camada: grava formulas (linha 4 = formula,
+#      abaixo = vazio), espera calcular, cola como valor;
+#   3. recoloca as vivas; elas calculam uma vez sobre valores parados, sem
+#      espera.
+#
+# Seguranca: se algo falhar depois de limpar as vivas, elas sao recolocadas
+# antes de sair. Camada que estourar a espera fica como formula (certa, so
+# pesada) e o script sai com 1.
 
-import os, re, sys, time, json, hashlib, random
+import os, re, sys, time, json, random
 from datetime import datetime
 
 import gspread
@@ -181,20 +191,6 @@ def achar_vivas(cab_mod):
         raise RuntimeError(f"Colunas vivas não achadas no cabeçalho da {ABA_MODELO}: {', '.join(faltando)}")
     return sorted(pos[norm(c)] for c in COLS_VIVAS)
 
-def faixas_congelar(largura, vivas):
-    """Faixas contiguas [ini, fim) de colunas a congelar (todas menos as vivas)."""
-    faixas, j = [], 0
-    while j < largura:
-        if j in vivas:
-            j += 1
-            continue
-        k = j
-        while k < largura and k not in vivas:
-            k += 1
-        faixas.append((j, k))
-        j = k
-    return faixas
-
 def ler_projetos(sh):
     """Projetos unicos da Carteira!A2:A na ordem de aparicao (= UNIQUE): o
     conteudo da coluna A da BD_Carteira. Lido como FORMULA: a Carteira nao tem
@@ -239,105 +235,138 @@ def gravar_projetos(sh, ws, projetos):
         params={"valueInputOption": "RAW"}, body={"values": vals}))
     log(f"✍️ Coluna A: {len(projetos)} projetos gravados como valor.")
 
-def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
-    """UMA escrita troca os valores congelados pelas formulas B..AN (nada e
-    limpo antes); depois copia as formulas por linha ate `ultima`."""
+RE_OUTRA_ABA = re.compile(r"('[^']+'|[A-Za-z_][A-Za-z0-9_]*)![$A-Z0-9:]+")
+RE_REF_CEL   = re.compile(r"(?<![A-Za-z0-9_$])\$?([A-Z]{1,3})\$?\d+")
+RE_REF_FAIXA = re.compile(r"(?<![A-Za-z0-9_$])\$?([A-Z]{1,3})\$?\d*:\$?([A-Z]{1,3})(?![A-Za-z(])")
+
+def deps_internas(formula, largura):
+    """Colunas da propria aba (indices 0-based) citadas na formula."""
+    t = re.sub(r'"[^"]*"', "", formula)          # strings
+    t = RE_OUTRA_ABA.sub(" ", t)                  # refs de outras abas
+    letras = set(RE_REF_CEL.findall(t))
+    for a, b in RE_REF_FAIXA.findall(t):
+        letras.update((a, b))
+    return {col_num(l) - 1 for l in letras if col_num(l) <= largura}
+
+def montar_camadas(formulas, vivas):
+    """Camadas das colunas congeladas: cada uma so depende de A, de outras
+    abas e de camadas anteriores. Congelada que dependa de viva = erro."""
     largura = len(formulas)
+    resto = [j for j in range(1, largura) if j not in vivas and formulas[j].startswith("=")]
+    deps = {j: deps_internas(formulas[j], largura) - {j} for j in resto}
+    erradas = [col_letra(j + 1) for j in resto if deps[j] & set(vivas)]
+    if erradas:
+        raise RuntimeError(f"Colunas congeladas que dependem de coluna viva: {', '.join(erradas)}")
+    prontas, camadas = {0}, []
+    while resto:
+        camada = [j for j in resto if deps[j] <= prontas]
+        if not camada:
+            raise RuntimeError("Dependência circular entre colunas: "
+                               + ", ".join(col_letra(j + 1) for j in resto))
+        camadas.append(camada)
+        prontas.update(camada)
+        resto = [j for j in resto if j not in camada]
+    return camadas
+
+def faixas(cols):
+    """Colunas (0-based) agrupadas em faixas contiguas [ini, fim)."""
+    out = []
+    for j in sorted(cols):
+        if out and out[-1][1] == j:
+            out[-1][1] = j + 1
+        else:
+            out.append([j, j + 1])
+    return [tuple(f) for f in out]
+
+def nomes(cols):
+    return ", ".join(col_letra(a + 1) if b - a == 1 else f"{col_letra(a + 1)}-{col_letra(b)}"
+                     for a, b in faixas(cols))
+
+def limpar_colunas(sh, ws, cols):
+    """Apaga o conteudo das colunas da linha 4 ate o fim da grade."""
+    reqs = [{"updateCells": {
+        "range": {"sheetId": ws.id, "startRowIndex": LINHA_DADOS - 1, "endRowIndex": ws.row_count,
+                  "startColumnIndex": a, "endColumnIndex": b},
+        "fields": "userEnteredValue"}} for a, b in faixas(cols)]
+    com_retry("limpar colunas", lambda: sh.batch_update({"requests": reqs}))
+
+def gravar_formulas(sh, ws, formulas, cols, por_linha, ultima):
+    """Linha 4 = formula; abaixo = vazio (o ARRAYFORMULA expande ali). Coluna
+    por linha: linha 4 copiada ate `ultima`."""
     grade = ws.row_count
-    # Faixas contiguas de colunas de array: linha 4 = formula, linhas 5..grade
-    # = "" para o ARRAYFORMULA ter onde expandir.
     data = []
-    j = 1
-    while j < largura:
-        if j in por_linha:
-            data.append({"range": f"'{ABA_ALVO}'!{col_letra(j + 1)}{LINHA_DADOS}",
-                         "values": [[formulas[j]]]})
-            j += 1
-            continue
-        k = j
-        while k + 1 < largura and (k + 1) not in por_linha:
-            k += 1
-        bloco = [formulas[j:k + 1]] + [[""] * (k - j + 1) for _ in range(grade - LINHA_DADOS)]
-        data.append({"range": f"'{ABA_ALVO}'!{col_letra(j + 1)}{LINHA_DADOS}:{col_letra(k + 1)}{grade}",
-                     "values": bloco})
-        j = k + 1
+    for a, b in faixas(cols):
+        data.append({"range": f"'{ABA_ALVO}'!{col_letra(a + 1)}{LINHA_DADOS}:{col_letra(b)}{grade}",
+                     "values": [formulas[a:b]] + [[""] * (b - a) for _ in range(grade - LINHA_DADOS)]})
     com_retry("gravar fórmulas", lambda: sh.values_batch_update(
         {"valueInputOption": "USER_ENTERED", "data": data}))
-    log("✍️ Fórmulas B..AN gravadas (linha 4).")
-    copiar_por_linha(sh, ws, por_linha, ultima)
+    copiar_por_linha(sh, ws, [j for j in cols if j in por_linha], ultima)
 
-def _hash(vals):
-    return hashlib.sha256(json.dumps(vals, ensure_ascii=False).encode()).hexdigest()
-
-def esperar_calculo(sh, ws, largura, vivas, ultima, projetos):
-    """Le os valores ate a primeira leitura completa sem celula carregando.
-    Uma basta: com a aba viva, ler A3:AN pode levar ~170-185s e o Google corta
-    em ~185s com 503, entao duas leituras seguidas quase nunca passavam (runs
-    41638130300 e 41651180624). O Google so devolve valores com o calculo
-    terminado. Confere que a coluna A e exatamente `projetos`.
-    Devolve o hash das colunas congeladas."""
+def esperar_calculo(sh, cols, ultima):
+    """Le as colunas ate a primeira leitura completa sem celula carregando
+    (o Google so devolve valores com o calculo terminado; com a aba pesada a
+    leitura volta 503 em ~185s)."""
+    rngs = [f"'{ABA_ALVO}'!{col_letra(a + 1)}{LINHA_DADOS}:{col_letra(b)}{ultima}" for a, b in faixas(cols)]
     limite = time.monotonic() + ESPERA_MAX_MIN * 60
     volta = 0
     while time.monotonic() < limite:
         volta += 1
-        rng = f"'{ABA_ALVO}'!A{LINHA_CAB}:{col_letra(largura)}{ultima}"
         t = time.monotonic()
         try:
-            vals = valores(sh.values_batch_get([rng]))[0]
+            blocos = valores(sh.values_batch_get(rngs))
         except RETRYABLE_EXC as e:
-            log(f"⏳ volta {volta}: leitura falhou em {time.monotonic() - t:.0f}s "
+            log(f"   ⏳ volta {volta}: leitura falhou em {time.monotonic() - t:.0f}s "
                 f"({type(e).__name__} {_status_code(e) or ''}) — planilha ainda calculando.")
             time.sleep(ESPERA_INTERVALO_S)
             continue
-        # vals[i] = linha LINHA_CAB + i
-        carregando = sum(1 for r in vals for c in r if str(c).strip() in MARCAS_CARREGANDO)
-        log(f"⏳ volta {volta}: leitura em {time.monotonic() - t:.0f}s | carregando {carregando}")
+        carregando = sum(1 for bl in blocos for r in bl for c in r if str(c).strip() in MARCAS_CARREGANDO)
+        log(f"   ⏳ volta {volta}: leitura em {time.monotonic() - t:.0f}s | carregando {carregando}")
         if carregando == 0:
-            col_a = [linha(vals, i, 1)[0] for i in range(LINHA_DADOS - LINHA_CAB, ultima - LINHA_CAB + 1)]
-            difs = [i for i, (a, p) in enumerate(zip(col_a, projetos)) if str(a) != str(p)]
-            if len(col_a) != len(projetos) or difs:
-                i = difs[0] if difs else min(len(col_a), len(projetos))
-                raise RuntimeError(f"Coluna A não bate com a Carteira (linha {LINHA_DADOS + i}: "
-                                   f"'{col_a[i] if i < len(col_a) else ''}' ≠ '{projetos[i] if i < len(projetos) else ''}').")
-            ancora = linha(vals, LINHA_DADOS - LINHA_CAB, largura)
-            quebradas = [col_letra(j + 1) for j, c in enumerate(ancora) if str(c).startswith("#REF")]
+            quebradas = [col_letra(a + 1 + k) for (a, b), bl in zip(faixas(cols), blocos)
+                         for k, c in enumerate(bl[0] if bl else []) if str(c).startswith("#REF")]
             if quebradas:
                 raise RuntimeError(f"#REF! na linha {LINHA_DADOS} (expansão bloqueada?): {', '.join(quebradas)}")
-            return _hash(_so_congeladas(vals, largura, vivas, ultima))
+            return
         time.sleep(ESPERA_INTERVALO_S)
     raise RuntimeError(f"Cálculo não estabilizou em {ESPERA_MAX_MIN:.0f} min — fórmulas mantidas na {ABA_ALVO}.")
 
-def colar_valores(sh, ws, faixas, ultima):
+def colar_valores(sh, ws, cols, ultima):
     reqs = []
-    for ini, fim in faixas:
-        rng = {"sheetId": ws.id, "startRowIndex": LINHA_CAB - 1, "endRowIndex": ultima,
-               "startColumnIndex": ini, "endColumnIndex": fim}
+    for a, b in faixas(cols):
+        rng = {"sheetId": ws.id, "startRowIndex": LINHA_DADOS - 1, "endRowIndex": ultima,
+               "startColumnIndex": a, "endColumnIndex": b}
         reqs.append({"copyPaste": {"source": rng, "destination": rng, "pasteType": "PASTE_VALUES"}})
     com_retry("colar como valores", lambda: sh.batch_update({"requests": reqs}))
 
-def _so_congeladas(vals, largura, vivas, ultima):
-    return [[c for j, c in enumerate(linha(vals, i, largura)) if j not in vivas]
-            for i in range(ultima - LINHA_CAB + 1)]
+def conferir_coluna_a(sh, projetos, ultima):
+    resp = com_retry("conferir coluna A", lambda: sh.values_batch_get(
+        [f"'{ABA_ALVO}'!A{LINHA_DADOS}:A{ultima}"], params={"valueRenderOption": "FORMULA"}))
+    col_a = [r[0] if r else "" for r in valores(resp)[0]]
+    col_a += [""] * (len(projetos) - len(col_a))
+    difs = [i for i, (a, p) in enumerate(zip(col_a, projetos)) if str(a) != str(p)]
+    if difs:
+        i = difs[0]
+        raise RuntimeError(f"Coluna A não bate com a Carteira (linha {LINHA_DADOS + i}: '{col_a[i]}' ≠ '{projetos[i]}').")
 
-def conferir(sh, largura, vivas, ultima, hash_calc):
-    """Colunas congeladas: sem formula e com os valores calculados.
-    Colunas vivas: formula ainda na linha 4."""
-    rng = f"'{ABA_ALVO}'!A{LINHA_CAB}:{col_letra(largura)}{ultima}"
-    resp = com_retry("conferir fórmulas", lambda: sh.values_batch_get(
-        [rng], params={"valueRenderOption": "FORMULA"}))
-    form = valores(resp)[0]
-    restantes = sum(1 for r in _so_congeladas(form, largura, vivas, ultima) for c in r if str(c).startswith("="))
-    if restantes:
-        raise RuntimeError(f"Ainda há {restantes} fórmulas nas colunas congeladas após colar valores.")
-    ancora = linha(form, LINHA_DADOS - LINHA_CAB, largura)
-    sem = [col_letra(j + 1) for j in vivas if not str(ancora[j]).startswith("=")]
-    if sem:
-        raise RuntimeError(f"Colunas vivas perderam a fórmula na linha {LINHA_DADOS}: {', '.join(sem)}")
-    # Diferenca aqui = alguma fonte mudou entre a leitura e a colagem; o
-    # copyPaste colou o valor mais novo, entao so avisa.
-    vals = com_retry("conferir valores", lambda: valores(sh.values_batch_get([rng]))[0])
-    if _hash(_so_congeladas(vals, largura, vivas, ultima)) != hash_calc:
-        log("⚠️ Valores colados diferem da leitura de estabilidade — alguma fonte mudou no meio; ficou o valor mais novo.")
+def conferir(sh, cols, ultima, esperado_formula):
+    """Colunas `cols` com (True) ou sem (False) formula da linha 4 a `ultima`."""
+    rngs = [f"'{ABA_ALVO}'!{col_letra(a + 1)}{LINHA_DADOS}:{col_letra(b)}{ultima}" for a, b in faixas(cols)]
+    blocos = com_retry("conferir", lambda: valores(sh.values_batch_get(
+        rngs, params={"valueRenderOption": "FORMULA"})))
+    if esperado_formula:
+        sem = [col_letra(a + 1 + k) for (a, b), bl in zip(faixas(cols), blocos)
+               for k in range(b - a) if not str(linha(bl, 0, b - a)[k]).startswith("=")]
+        if sem:
+            raise RuntimeError(f"Colunas sem fórmula na linha {LINHA_DADOS}: {', '.join(sem)}")
+    else:
+        restantes = sum(1 for bl in blocos for r in bl for c in r if str(c).startswith("="))
+        if restantes:
+            raise RuntimeError(f"Ainda há {restantes} fórmulas em {nomes(cols)} após colar valores.")
+
+def recolocar_vivas(sh, ws, formulas, vivas, por_linha, ultima):
+    gravar_formulas(sh, ws, formulas, vivas, por_linha, ultima)
+    conferir(sh, vivas, LINHA_DADOS, True)
+    log(f"🌿 Colunas vivas recolocadas: {nomes(vivas)}.")
 
 # ========= EXECUÇÃO =========
 def main():
@@ -349,26 +378,34 @@ def main():
 
     formulas, cab_mod = ler_modelo(sh, largura)
     vivas = achar_vivas(cab_mod)
-    faixas = faixas_congelar(largura, vivas)
-    log(f"🌿 Colunas vivas (seguem fórmula): {', '.join(col_letra(j + 1) for j in vivas)}.")
+    camadas = montar_camadas(formulas, vivas)
+    por_linha = colunas_por_linha(formulas)
+    log(f"🌿 Colunas vivas: {nomes(vivas)}.")
+    for i, c in enumerate(camadas, 1):
+        log(f"🧱 Camada {i} ({len(c)} colunas): {nomes(c)}.")
     projetos = ler_projetos(sh)
     n = len(projetos)
     ultima = LINHA_DADOS - 1 + n
-    por_linha = colunas_por_linha(formulas)
     log(f"📋 Carteira: {n} projetos únicos → BD_Carteira até a linha {ultima} (grade {ws.row_count}).")
     if n == 0:
         raise RuntimeError("Carteira sem projetos — não vou congelar uma BD_Carteira vazia.")
 
-    gravar_projetos(sh, ws, projetos)
-    aplicar_formulas(sh, ws, formulas, por_linha, ultima)
-    t_calc = time.perf_counter()
-    h = esperar_calculo(sh, ws, largura, vivas, ultima, projetos)
-    log(f"✅ Cálculo estável em {time.perf_counter() - t_calc:.0f}s.")
-
-    colar_valores(sh, ws, faixas, ultima)
-    conferir(sh, largura, vivas, ultima, h)
-    log(f"🧊 {ABA_ALVO} congelada em valores (A{LINHA_CAB}:{ULTIMA_COL}{ultima}, "
-        f"menos {', '.join(col_letra(j + 1) for j in vivas)}). "
+    limpar_colunas(sh, ws, vivas)
+    log(f"🧽 Colunas vivas limpas: {nomes(vivas)}.")
+    try:
+        gravar_projetos(sh, ws, projetos)
+        conferir_coluna_a(sh, projetos, ultima)
+        for i, cols in enumerate(camadas, 1):
+            t = time.perf_counter()
+            gravar_formulas(sh, ws, formulas, cols, por_linha, ultima)
+            log(f"✍️ Camada {i}: fórmulas gravadas ({nomes(cols)}).")
+            esperar_calculo(sh, cols, ultima)
+            colar_valores(sh, ws, cols, ultima)
+            conferir(sh, cols, ultima, False)
+            log(f"🧊 Camada {i} congelada em {time.perf_counter() - t:.0f}s.")
+    finally:
+        recolocar_vivas(sh, ws, formulas, vivas, por_linha, ultima)
+    log(f"✅ {ABA_ALVO} congelada (A{LINHA_DADOS}:{ULTIMA_COL}{ultima}, menos {nomes(vivas)}). "
         f"Duração total {time.perf_counter() - t0:.0f}s.")
 
 if __name__ == "__main__":
