@@ -11,8 +11,12 @@
 #
 # Modelo das formulas: aba BD_Formulas, linha 1 = cabecalho na mesma ordem da
 # BD_Carteira, linha 2 = formula de cada coluna como TEXTO (gravada RAW, para
-# nao calcular ali). Todas vao para a linha 4; a coluna A (=UNIQUE(Carteira!A2:A),
-# a coluna vital) tambem, e A3 fica com o cabecalho. Coluna cujo modelo nao usa intervalo aberto
+# nao calcular ali). B..AN vao para a linha 4; A3 fica com o cabecalho.
+# Coluna A (a vital) NAO e formula: o script grava como valor a lista de
+# projetos unicos da Carteira!A2:A, na ordem de aparicao (= UNIQUE). Com o
+# UNIQUE vivo as 39 colunas recalculavam sobre uma lista ainda sendo gerada e
+# o calculo passava de 45 min; com A parada ele fecha em minutos. O modelo de
+# A em BD_Formulas!A2 fica so de referencia. Coluna cujo modelo nao usa intervalo aberto
 # (A4:A) e formula POR LINHA (hoje Z e AK) e e copiada para baixo so ate o
 # ultimo projeto, nao ate a linha 20000.
 #
@@ -164,9 +168,7 @@ def ler_modelo(sh, largura):
         formulas = atual
 
     formulas = [str(f).strip() for f in formulas]
-    vazias = [col_letra(j + 1) for j, f in enumerate(formulas) if not f.startswith("=")]
-    if formulas[0] == "" or not formulas[0].startswith("="):
-        raise RuntimeError(f"{ABA_MODELO}!A2 (coluna vital A) não tem fórmula.")
+    vazias = [col_letra(j + 1) for j, f in enumerate(formulas) if j > 0 and not f.startswith("=")]
     if vazias:
         log(f"ℹ️ Colunas sem fórmula no modelo (ficam vazias): {', '.join(vazias)}")
     return formulas, cab_mod
@@ -193,15 +195,15 @@ def faixas_congelar(largura, vivas):
         j = k
     return faixas
 
-def contar_projetos(sh):
-    """Projetos unicos da Carteira = linhas que o UNIQUE de A4 vai gerar.
-    Lido como FORMULA: a Carteira nao tem formula, entao vem o mesmo valor, sem
-    esperar o recalculo da planilha (FORMATTED_VALUE levou 11 min de 503)."""
+def ler_projetos(sh):
+    """Projetos unicos da Carteira!A2:A na ordem de aparicao (= UNIQUE): o
+    conteudo da coluna A da BD_Carteira. Lido como FORMULA: a Carteira nao tem
+    formula, entao vem o mesmo valor, sem esperar o recalculo da planilha
+    (FORMATTED_VALUE levou 11 min de 503)."""
     resp = com_retry("ler Carteira!A", lambda: sh.values_batch_get(
-        [f"'{ABA_CARTEIRA}'!A1:A"], params={"valueRenderOption": "FORMULA"}))
-    col = [str(r[0]).strip() if r else "" for r in valores(resp)[0]]
-    unicos = {v for v in col[1:] if v}  # col[0] = cabecalho (fora do A2:A)
-    return len(unicos)
+        [f"'{ABA_CARTEIRA}'!A2:A"], params={"valueRenderOption": "FORMULA"}))
+    col = [r[0] if r else "" for r in valores(resp)[0]]
+    return list(dict.fromkeys(v for v in col if str(v).strip()))
 
 def colunas_por_linha(formulas):
     return [j for j in range(1, len(formulas))
@@ -228,19 +230,24 @@ def copiar_por_linha(sh, ws, por_linha, ultima):
         log(f"✍️ Fórmulas por linha ({', '.join(col_letra(j + 1) for j in por_linha)}) "
             f"copiadas até a linha {ultima}.")
 
+def gravar_projetos(sh, ws, projetos):
+    """Coluna A = lista de projetos como valor (RAW), resto da grade limpo."""
+    grade = ws.row_count
+    vals = [[p] for p in projetos] + [[""] for _ in range(grade - LINHA_DADOS + 1 - len(projetos))]
+    com_retry("gravar projetos em A", lambda: sh.values_update(
+        f"'{ABA_ALVO}'!A{LINHA_DADOS}:A{grade}",
+        params={"valueInputOption": "RAW"}, body={"values": vals}))
+    log(f"✍️ Coluna A: {len(projetos)} projetos gravados como valor.")
+
 def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
-    """UMA escrita troca os valores congelados pelas formulas (nada e limpo
-    antes); depois copia as formulas por linha ate `ultima`.
-    Nao inverter: copiando Z/AK antes (e92ad7e), as 13 mil formulas por linha
-    ja vivas recalculavam a cada coluna de array e o calculo foi de ~8 min
-    para ~20-45+ min (runs 41747169101 e 41802367571). Nesta ordem a copia
-    leva alguns 503, mas a aba fecha o calculo em segundos depois dela."""
+    """UMA escrita troca os valores congelados pelas formulas B..AN (nada e
+    limpo antes); depois copia as formulas por linha ate `ultima`."""
     largura = len(formulas)
     grade = ws.row_count
     # Faixas contiguas de colunas de array: linha 4 = formula, linhas 5..grade
     # = "" para o ARRAYFORMULA ter onde expandir.
     data = []
-    j = 0
+    j = 1
     while j < largura:
         if j in por_linha:
             data.append({"range": f"'{ABA_ALVO}'!{col_letra(j + 1)}{LINHA_DADOS}",
@@ -256,25 +263,24 @@ def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
         j = k + 1
     com_retry("gravar fórmulas", lambda: sh.values_batch_update(
         {"valueInputOption": "USER_ENTERED", "data": data}))
-    log("✍️ Fórmulas gravadas (linha 4).")
+    log("✍️ Fórmulas B..AN gravadas (linha 4).")
     copiar_por_linha(sh, ws, por_linha, ultima)
 
 def _hash(vals):
     return hashlib.sha256(json.dumps(vals, ensure_ascii=False).encode()).hexdigest()
 
-def esperar_calculo(sh, ws, largura, por_linha, vivas, ultima, esperado):
+def esperar_calculo(sh, ws, largura, vivas, ultima, projetos):
     """Le os valores ate a primeira leitura completa sem celula carregando.
-    Uma basta: com a aba toda viva, ler A3:AN leva ~170-185s e o Google corta
-    em ~185s com 503, entao duas leituras seguidas quase nunca passam (runs
-    41638130300 e 41651180624: so a volta 6 leu, as outras 13 deram 503).
-    O Google so devolve valores com o calculo terminado. A extensao real e a
-    do UNIQUE em A: se passar de `ultima`, estende as formulas por linha e
-    recomeca. Devolve (ultima, hash das colunas congeladas)."""
+    Uma basta: com a aba viva, ler A3:AN pode levar ~170-185s e o Google corta
+    em ~185s com 503, entao duas leituras seguidas quase nunca passavam (runs
+    41638130300 e 41651180624). O Google so devolve valores com o calculo
+    terminado. Confere que a coluna A e exatamente `projetos`.
+    Devolve o hash das colunas congeladas."""
     limite = time.monotonic() + ESPERA_MAX_MIN * 60
     volta = 0
     while time.monotonic() < limite:
         volta += 1
-        rng = f"'{ABA_ALVO}'!A{LINHA_CAB}:{col_letra(largura)}{ws.row_count}"
+        rng = f"'{ABA_ALVO}'!A{LINHA_CAB}:{col_letra(largura)}{ultima}"
         t = time.monotonic()
         try:
             vals = valores(sh.values_batch_get([rng]))[0]
@@ -284,24 +290,20 @@ def esperar_calculo(sh, ws, largura, por_linha, vivas, ultima, esperado):
             time.sleep(ESPERA_INTERVALO_S)
             continue
         # vals[i] = linha LINHA_CAB + i
-        ult_a = max((LINHA_CAB + i for i, r in enumerate(vals) if r and str(r[0]).strip()), default=LINHA_CAB)
-        n_a = sum(1 for r in vals[1:] if r and str(r[0]).strip())
         carregando = sum(1 for r in vals for c in r if str(c).strip() in MARCAS_CARREGANDO)
-        log(f"⏳ volta {volta}: leitura em {time.monotonic() - t:.0f}s | projetos em A {n_a} "
-            f"(Carteira {esperado}) | última linha {ult_a} | carregando {carregando}")
-        if ult_a > ultima:
-            ultima = ult_a
-            log(f"↕️ UNIQUE foi além do previsto — estendendo fórmulas por linha até {ultima}.")
-            copiar_por_linha(sh, ws, por_linha, ultima)
-        elif n_a > 0 and carregando == 0:
+        log(f"⏳ volta {volta}: leitura em {time.monotonic() - t:.0f}s | carregando {carregando}")
+        if carregando == 0:
+            col_a = [linha(vals, i, 1)[0] for i in range(LINHA_DADOS - LINHA_CAB, ultima - LINHA_CAB + 1)]
+            difs = [i for i, (a, p) in enumerate(zip(col_a, projetos)) if str(a) != str(p)]
+            if len(col_a) != len(projetos) or difs:
+                i = difs[0] if difs else min(len(col_a), len(projetos))
+                raise RuntimeError(f"Coluna A não bate com a Carteira (linha {LINHA_DADOS + i}: "
+                                   f"'{col_a[i] if i < len(col_a) else ''}' ≠ '{projetos[i] if i < len(projetos) else ''}').")
             ancora = linha(vals, LINHA_DADOS - LINHA_CAB, largura)
             quebradas = [col_letra(j + 1) for j, c in enumerate(ancora) if str(c).startswith("#REF")]
             if quebradas:
                 raise RuntimeError(f"#REF! na linha {LINHA_DADOS} (expansão bloqueada?): {', '.join(quebradas)}")
-            if n_a != esperado:
-                log(f"⚠️ A tem {n_a} projetos e a Carteira {esperado} únicos — "
-                    f"diferença de grafia (maiúsculas/espaços); segue com o que o UNIQUE gerou.")
-            return ultima, _hash(_so_congeladas(vals, largura, vivas, ultima))
+            return _hash(_so_congeladas(vals, largura, vivas, ultima))
         time.sleep(ESPERA_INTERVALO_S)
     raise RuntimeError(f"Cálculo não estabilizou em {ESPERA_MAX_MIN:.0f} min — fórmulas mantidas na {ABA_ALVO}.")
 
@@ -349,16 +351,18 @@ def main():
     vivas = achar_vivas(cab_mod)
     faixas = faixas_congelar(largura, vivas)
     log(f"🌿 Colunas vivas (seguem fórmula): {', '.join(col_letra(j + 1) for j in vivas)}.")
-    n = contar_projetos(sh)
+    projetos = ler_projetos(sh)
+    n = len(projetos)
     ultima = LINHA_DADOS - 1 + n
     por_linha = colunas_por_linha(formulas)
     log(f"📋 Carteira: {n} projetos únicos → BD_Carteira até a linha {ultima} (grade {ws.row_count}).")
     if n == 0:
         raise RuntimeError("Carteira sem projetos — não vou congelar uma BD_Carteira vazia.")
 
+    gravar_projetos(sh, ws, projetos)
     aplicar_formulas(sh, ws, formulas, por_linha, ultima)
     t_calc = time.perf_counter()
-    ultima, h = esperar_calculo(sh, ws, largura, por_linha, vivas, ultima, n)
+    h = esperar_calculo(sh, ws, largura, vivas, ultima, projetos)
     log(f"✅ Cálculo estável em {time.perf_counter() - t_calc:.0f}s.")
 
     colar_valores(sh, ws, faixas, ultima)
