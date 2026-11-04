@@ -229,25 +229,22 @@ def copiar_por_linha(sh, ws, por_linha, ultima):
             f"copiadas até a linha {ultima}.")
 
 def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
-    """Primeiro as formulas por linha (linha 4 + copia ate `ultima`), enquanto
-    o resto da aba ainda esta congelado e a planilha responde rapido; depois
-    UMA escrita troca os valores congelados pelas formulas de array (nada e
-    limpo antes). Na ordem inversa a copia caia no recalculo e voltava 503
-    (run 41635040839: 6 tentativas, ~20 min, falhou)."""
+    """UMA escrita troca os valores congelados pelas formulas (nada e limpo
+    antes); depois copia as formulas por linha ate `ultima`.
+    Nao inverter: copiando Z/AK antes (e92ad7e), as 13 mil formulas por linha
+    ja vivas recalculavam a cada coluna de array e o calculo foi de ~8 min
+    para ~20-45+ min (runs 41747169101 e 41802367571). Nesta ordem a copia
+    leva alguns 503, mas a aba fecha o calculo em segundos depois dela."""
     largura = len(formulas)
     grade = ws.row_count
-    if por_linha:
-        com_retry("gravar fórmulas por linha", lambda: sh.values_batch_update(
-            {"valueInputOption": "USER_ENTERED",
-             "data": [{"range": f"'{ABA_ALVO}'!{col_letra(j + 1)}{LINHA_DADOS}",
-                       "values": [[formulas[j]]]} for j in por_linha]}))
-        copiar_por_linha(sh, ws, por_linha, ultima)
     # Faixas contiguas de colunas de array: linha 4 = formula, linhas 5..grade
     # = "" para o ARRAYFORMULA ter onde expandir.
     data = []
     j = 0
     while j < largura:
         if j in por_linha:
+            data.append({"range": f"'{ABA_ALVO}'!{col_letra(j + 1)}{LINHA_DADOS}",
+                         "values": [[formulas[j]]]})
             j += 1
             continue
         k = j
@@ -259,7 +256,8 @@ def aplicar_formulas(sh, ws, formulas, por_linha, ultima):
         j = k + 1
     com_retry("gravar fórmulas", lambda: sh.values_batch_update(
         {"valueInputOption": "USER_ENTERED", "data": data}))
-    log("✍️ Fórmulas de array gravadas (linha 4).")
+    log("✍️ Fórmulas gravadas (linha 4).")
+    copiar_por_linha(sh, ws, por_linha, ultima)
 
 def _hash(vals):
     return hashlib.sha256(json.dumps(vals, ensure_ascii=False).encode()).hexdigest()
